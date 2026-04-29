@@ -24,6 +24,7 @@ creds. The Claude Agent SDK's `query()` accepts per-call `env` already
 site (`orchestrator-agent.ts:867-869`).
 
 Today Archon has two env-var sources merged at that site:
+
 1. `config.envVars` from `.archon/config.yaml` (process-wide)
 2. `getCodebaseEnvVars(conversation.codebase_id)` (per-codebase)
 
@@ -33,25 +34,29 @@ This patch adds a third source: per-user env vars indexed by
 ### Shape
 
 1. **Config schema addition** in `packages/core/src/config/config-loader.ts`:
+
    ```yaml
    # .archon/config.yaml
    userEnvVars:
-     U01ABC123:                       # Slack user ID
+     U01ABC123: # Slack user ID
        HOME: /home/appuser/.archon/users/U01ABC123
      U02DEF456:
        HOME: /home/appuser/.archon/users/U02DEF456
    ```
+
    Type: `Record<string, Record<string, string>>` on `MergedConfig`.
    Optional. Empty/missing → no overlay (backward compatible).
 
 2. **Plumb `platformUserId` through `HandleMessageContext`** in
    `packages/core/src/types/index.ts`:
+
    ```typescript
    export interface HandleMessageContext {
      // existing...
      readonly platformUserId?: string;
    }
    ```
+
    Adapters that know the user ID populate it; others leave it `undefined`.
 
 3. **Slack adapter** populates `platformUserId: event.user` when calling
@@ -60,6 +65,7 @@ This patch adds a third source: per-user env vars indexed by
    `SlackMessageEvent.user` which the server callback already destructures.)
 
 4. **Orchestrator overlay** in `orchestrator-agent.ts` near line 854:
+
    ```typescript
    const userEnvVarsMap = config.userEnvVars ?? {};
    const userEnvVars =
@@ -69,7 +75,7 @@ This patch adds a third source: per-user env vars indexed by
    const effectiveEnv = {
      ...(config.envVars ?? {}),
      ...dbEnvVars,
-     ...userEnvVars,   // user-level overrides codebase-level
+     ...userEnvVars, // user-level overrides codebase-level
    };
    ```
 
@@ -100,8 +106,9 @@ ECS Fargate CodeDeploy blue/green keeps blue tasks alive for
 `terminationWaitTimeInMinutes` (planned: 240 / 4 hr) so in-flight
 workflows can finish. ALB cleanly stops sending HTTP traffic to blue.
 But Slack Socket Mode is outbound — blue's socket stays open and Slack
-random-routes events to it, so blue picks up *new* `@archon` mentions
+random-routes events to it, so blue picks up _new_ `@archon` mentions
 and runs them on old code. We want blue to:
+
 - Stop accepting new work (Slack mentions, web UI new conversations)
 - Continue handling in-flight workflows (including posting to their
   existing Slack threads via the `WebClient`)
@@ -109,23 +116,26 @@ and runs them on old code. We want blue to:
 ### Shape
 
 1. **In-process flag** in `packages/server/src/index.ts`:
+
    ```typescript
    let acceptingNewWork = true;
    ```
+
    Exported from a small drain-state module so adapters and route
    handlers can both consult it.
 
 2. **New endpoint** `POST /admin/drain` (auth via `Authorization: Bearer
-   <ADMIN_DRAIN_SECRET>`, secret read from env at startup, fail-closed
+<ADMIN_DRAIN_SECRET>`, secret read from env at startup, fail-closed
    if the env var is unset and the request arrives):
+
    ```typescript
-   app.post('/admin/drain', async (c) => {
+   app.post('/admin/drain', async c => {
      const authz = c.req.header('Authorization');
      if (authz !== `Bearer ${process.env.ADMIN_DRAIN_SECRET}`) {
        return c.json({ error: 'unauthorized' }, 401);
      }
      setAcceptingNewWork(false);
-     slack?.stop();           // closes SocketModeClient inbound only
+     slack?.stop(); // closes SocketModeClient inbound only
      getLog().info('admin.drain_initiated');
      return c.json({ status: 'draining' });
    });

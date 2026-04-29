@@ -54,7 +54,9 @@ registerBuiltinProviders();
 registerCommunityProviders();
 
 import { OpenAPIHono } from '@hono/zod-openapi';
+import { timingSafeEqual } from 'node:crypto';
 import { validationErrorHook } from './routes/openapi-defaults';
+import { setAcceptingNewWork } from './drain-state';
 import { TelegramAdapter, GitHubAdapter, DiscordAdapter, SlackAdapter } from '@archon/adapters';
 import { GiteaAdapter } from '@archon/adapters/community/forge/gitea';
 import { GitLabAdapter } from '@archon/adapters/community/forge/gitlab';
@@ -582,6 +584,34 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   app.get('/health/concurrency', c => {
     const { active, queuedTotal, maxConcurrent } = lockManager.getStats();
     return c.json({ status: 'ok', active, queuedTotal, maxConcurrent });
+  });
+
+  // Drain endpoint — used by CodeDeploy AfterAllowTraffic during blue/green
+  // rollouts. Flips the in-process acceptingNewWork flag and closes the Slack
+  // inbound socket so blue tasks stop picking up new mentions while in-flight
+  // workflows finish. Slack's WebClient stays alive (App.stop() only stops
+  // the receiver), so existing-thread postMessage calls still work.
+  //
+  // Auth: Authorization: Bearer <ADMIN_DRAIN_SECRET>. Fails closed (503) if
+  // the env var is unset.
+  app.post('/admin/drain', c => {
+    const secret = process.env.ADMIN_DRAIN_SECRET;
+    if (!secret) {
+      getLog().warn('admin.drain_misconfigured');
+      return c.json({ error: 'admin drain not configured' }, 503);
+    }
+    const authz = c.req.header('Authorization') ?? '';
+    const expected = `Bearer ${secret}`;
+    const authzBuf = Buffer.from(authz);
+    const expectedBuf = Buffer.from(expected);
+    if (authzBuf.length !== expectedBuf.length || !timingSafeEqual(authzBuf, expectedBuf)) {
+      getLog().warn('admin.drain_unauthorized');
+      return c.json({ error: 'unauthorized' }, 401);
+    }
+    setAcceptingNewWork(false);
+    slack?.stop();
+    getLog().info('admin.drain_initiated');
+    return c.json({ status: 'draining' });
   });
 
   // Serve web UI static files in production

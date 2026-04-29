@@ -44,6 +44,7 @@ import {
   BUNDLED_IS_BINARY,
   BUNDLED_VERSION,
 } from '@archon/paths';
+import { isAcceptingNewWork } from '../drain-state';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { parseWorkflow } from '@archon/workflows/loader';
 import { isValidCommandName } from '@archon/workflows/command-validation';
@@ -1160,6 +1161,15 @@ export function registerApiRoutes(
   // POST /api/conversations - Create new conversation
   // Accepts optional `message` field for atomic create+send (avoids ghost "Untitled" entries)
   registerOpenApiRoute(createConversationRoute, async c => {
+    // Drain gate — refuse new conversations while the task is shutting down.
+    // Existing conversations continue to function (their message endpoint is
+    // not gated). See packages/server/src/drain-state.ts.
+    if (!isAcceptingNewWork()) {
+      return c.json(
+        { error: 'service is draining', detail: 'New conversations are not being accepted' },
+        503
+      );
+    }
     try {
       const { codebaseId, message } = getValidatedBody(c, createConversationBodySchema);
 
