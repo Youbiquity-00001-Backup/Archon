@@ -1,3 +1,27 @@
+## Youbiquity soft-fork — read me first
+
+You are on the `youbiquity` branch of `Youbiquity-00001-Backup/Archon` —
+a soft-fork of upstream `coleam00/Archon` that tracks upstream `main`
+and carries two private patches:
+
+1. **`user_env_vars`** — per-user env injection at the orchestrator's
+   `requestOptions` build site, threaded via `HandleMessageContext.platformUserId`.
+2. **`POST /admin/drain`** — auth-gated endpoint that flips an
+   in-process flag and stops Slack inbound socket for blue/green deploy drains.
+
+See [`PATCH-PLAN.md`](./PATCH-PLAN.md) for the full design.
+
+**Cross-repo context** lives in
+[`archon-youbiquity/CLAUDE.md`](https://github.com/Youbiquity-00001-Backup/archon-youbiquity/blob/main/CLAUDE.md)
+and the canonical AWS deployment design is in
+[`archon-youbiquity/ARCHON-SLACK-AWS-PLAN.md`](https://github.com/Youbiquity-00001-Backup/archon-youbiquity/blob/main/ARCHON-SLACK-AWS-PLAN.md).
+
+**When merging from upstream `coleam00/Archon`:** this section is the
+only intentional divergence in this file — keep it on top during conflict
+resolution and accept upstream's content for the rest.
+
+---
+
 ## Project Overview
 
 **Remote Agentic Coding Platform**: Control AI coding assistants (Claude Code SDK, Codex SDK) remotely from Slack, Telegram, and GitHub. Built with **Bun + TypeScript + SQLite/PostgreSQL**, single-developer tool for AI-assisted development practitioners. Architecture prioritizes simplicity, flexibility, and user control.
