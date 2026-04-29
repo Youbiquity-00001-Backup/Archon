@@ -404,6 +404,12 @@ function mergeGlobalConfig(defaults: MergedConfig, global: GlobalConfig): Merged
     result.concurrency.maxConversations = global.concurrency.maxConversations;
   }
 
+  // Per-user env-var overrides — pass through unchanged. Repo configs do not
+  // contribute to userEnvVars (per-user mappings are user-scoped, not project-scoped).
+  if (global.userEnvVars) {
+    result.userEnvVars = global.userEnvVars;
+  }
+
   return result;
 }
 

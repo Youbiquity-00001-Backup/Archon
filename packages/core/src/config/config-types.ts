@@ -78,6 +78,25 @@ export interface GlobalConfig {
   assistants?: AssistantDefaultsConfig;
 
   /**
+   * Per-user env-var overrides keyed by platform user ID (e.g. Slack user ID).
+   * Each user's map is overlaid onto the SDK call's env when the orchestrator
+   * sees a matching `HandleMessageContext.platformUserId` — highest precedence.
+   *
+   * Primary use case: multi-tenant Anthropic OAuth via per-user `HOME`:
+   *
+   *   userEnvVars:
+   *     U01ABC123:
+   *       HOME: /home/appuser/.archon/users/U01ABC123
+   *     U02DEF456:
+   *       HOME: /home/appuser/.archon/users/U02DEF456
+   *
+   * Each user's `.credentials.json` lives at `<their HOME>/.claude/.credentials.json`,
+   * loaded by the Claude Agent SDK subprocess via `CLAUDE_USE_GLOBAL_AUTH=true`.
+   * Sensitive — populate from a secret store, never commit values.
+   */
+  userEnvVars?: Record<string, Record<string, string>>;
+
+  /**
    * Platform streaming preferences (can be overridden per conversation)
    */
   streaming?: {
@@ -298,6 +317,21 @@ export interface MergedConfig {
    * Undefined when no env vars are configured.
    */
   envVars?: Record<string, string>;
+
+  /**
+   * Per-user env-var overrides keyed by platform user ID (e.g. Slack user ID).
+   * Looked up via `HandleMessageContext.platformUserId` in the orchestrator
+   * and overlaid onto the SDK call's env at highest precedence (over both
+   * `envVars` and codebase-scoped DB env vars).
+   *
+   * Primary use case: per-user `HOME` injection so each user's Claude SDK
+   * call reads OAuth credentials from their own `~/.claude/.credentials.json`
+   * in a multi-tenant deployment. Sourced from `GlobalConfig.userEnvVars`.
+   *
+   * Sensitive — when populated from secrets, the YAML file should be mounted
+   * read-only from a secret store, never committed.
+   */
+  userEnvVars?: Record<string, Record<string, string>>;
 }
 
 /**

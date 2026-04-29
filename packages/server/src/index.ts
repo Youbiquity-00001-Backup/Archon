@@ -454,6 +454,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
               threadContext,
               parentConversationId,
               isolationHints: { workflowType: 'thread', workflowId: conversationId },
+              platformUserId: event.user || undefined,
             });
           })
           .catch(createMessageErrorHandler('Slack', slackAdapter, conversationId));

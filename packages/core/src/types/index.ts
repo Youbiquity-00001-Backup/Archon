@@ -50,6 +50,14 @@ export interface HandleMessageContext {
   readonly threadContext?: string;
   readonly parentConversationId?: string;
   readonly isolationHints?: IsolationHints;
+  /**
+   * Platform user identifier for the message sender (e.g. Slack user ID).
+   * When set, the orchestrator looks up matching env-var overrides from
+   * `MergedConfig.userEnvVars[platformUserId]` and overlays them onto the
+   * SDK call's env (highest precedence). Adapters that know the user
+   * populate this; others leave it undefined.
+   */
+  readonly platformUserId?: string;
   readonly attachedFiles?: AttachedFile[];
 }
 

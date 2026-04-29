@@ -329,6 +329,48 @@ streaming:
       expect(config.assistants.codex.additionalDirectories).toEqual(['/repo']);
     });
 
+    test('propagates userEnvVars from global config', async () => {
+      const pathMatches = (path: string, pattern: string): boolean => {
+        const normalizedPath = path.replace(/\\/g, '/');
+        return normalizedPath.includes(pattern);
+      };
+
+      let globalConfigRead = false;
+      mockReadConfigFile.mockImplementation(async (path: string) => {
+        if (pathMatches(path, '.archon/config.yaml') && !globalConfigRead) {
+          globalConfigRead = true;
+          return [
+            'userEnvVars:',
+            '  U01ABC123:',
+            '    HOME: /home/appuser/.archon/users/U01ABC123',
+            '  U02DEF456:',
+            '    HOME: /home/appuser/.archon/users/U02DEF456',
+            '    EXTRA: value',
+          ].join('\n');
+        }
+        const error = new Error('ENOENT') as NodeJS.ErrnoException;
+        error.code = 'ENOENT';
+        throw error;
+      });
+
+      const config = await loadConfig();
+      expect(config.userEnvVars).toEqual({
+        U01ABC123: { HOME: '/home/appuser/.archon/users/U01ABC123' },
+        U02DEF456: { HOME: '/home/appuser/.archon/users/U02DEF456', EXTRA: 'value' },
+      });
+    });
+
+    test('userEnvVars is undefined when not configured', async () => {
+      mockReadConfigFile.mockImplementation(async () => {
+        const error = new Error('ENOENT') as NodeJS.ErrnoException;
+        error.code = 'ENOENT';
+        throw error;
+      });
+
+      const config = await loadConfig();
+      expect(config.userEnvVars).toBeUndefined();
+    });
+
     test('propagates baseBranch from repo worktree config', async () => {
       const pathMatches = (path: string, pattern: string): boolean => {
         const normalizedPath = path.replace(/\\/g, '/');

@@ -542,8 +542,14 @@ export async function handleMessage(
   message: string,
   context?: HandleMessageContext
 ): Promise<void> {
-  const { issueContext, threadContext, parentConversationId, isolationHints, attachedFiles } =
-    context ?? {};
+  const {
+    issueContext,
+    threadContext,
+    parentConversationId,
+    isolationHints,
+    attachedFiles,
+    platformUserId,
+  } = context ?? {};
   try {
     getLog().debug({ conversationId }, 'orchestrator_message_received');
 
@@ -851,7 +857,14 @@ export async function handleMessage(
         );
       }
     }
-    const effectiveEnv = { ...(config.envVars ?? {}), ...dbEnvVars };
+    // Per-user env overlay: when the message has a known platformUserId and
+    // the merged config has a matching userEnvVars entry, overlay those vars
+    // at highest precedence. Used primarily for per-user Anthropic OAuth via
+    // a per-user HOME pointing at <home>/.claude/.credentials.json.
+    const userEnvVarsMap = config.userEnvVars ?? {};
+    const userOverlay =
+      platformUserId && userEnvVarsMap[platformUserId] ? userEnvVarsMap[platformUserId] : {};
+    const effectiveEnv = { ...(config.envVars ?? {}), ...dbEnvVars, ...userOverlay };
 
     // Warn if provider doesn't support env injection but env vars are configured
     if (Object.keys(effectiveEnv).length > 0) {
