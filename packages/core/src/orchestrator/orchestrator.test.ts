@@ -217,6 +217,8 @@ const mockCodebase: Codebase = {
   default_cwd: '/workspace/test-project',
   ai_assistant_type: 'claude',
   commands: {},
+  registered_by_slack_user_id: null,
+  registered_at: null,
   created_at: new Date(),
   updated_at: new Date(),
 };

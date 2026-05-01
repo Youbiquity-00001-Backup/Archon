@@ -19,11 +19,36 @@ function getLog(): ReturnType<typeof createLogger> {
 
 const MAX_MARKDOWN_BLOCK_LENGTH = 12000; // Slack markdown block limit
 
+/**
+ * Slash-command callback invoked when a registered Slack slash command fires.
+ * - `slackUserId` is the invoking user's Slack id (always present in Bolt's
+ *   slash-command payload).
+ * - `text` is the part after the command name, untrimmed verbatim.
+ * - `isDM` is true iff the command was issued from the bot DM channel; some
+ *   commands (notably `/archon-creds anthropic <json>`) refuse to run in
+ *   public channels for obvious reasons.
+ *
+ * Handler returns the reply text and whether it should be ephemeral
+ * (visible only to the invoker). Errors thrown by the handler are caught,
+ * logged, and surfaced to the user as a generic ephemeral message.
+ */
+export type SlashCommandHandler = (
+  slackUserId: string,
+  text: string,
+  isDM: boolean
+) => Promise<{ replyText: string; ephemeral?: boolean }>;
+
 export class SlackAdapter implements IPlatformAdapter {
   private app: App;
   private streamingMode: 'stream' | 'batch';
   private messageHandler: ((event: SlackMessageEvent) => Promise<void>) | null = null;
   private allowedUserIds: string[];
+  /**
+   * Map of slash-command name (with leading slash) → handler. Registration
+   * goes through `onSlashCommand()` so the adapter stays domain-agnostic
+   * (same pattern as `onMessage()`). `start()` wires each entry into Bolt.
+   */
+  private slashHandlers = new Map<string, SlashCommandHandler>();
 
   constructor(botToken: string, appToken: string, mode: 'stream' | 'batch' = 'batch') {
     this.app = new App({
@@ -239,9 +264,81 @@ export class SlackAdapter implements IPlatformAdapter {
   }
 
   /**
+   * Register a slash command handler.
+   *
+   * `name` is the full command including leading `/` (e.g. `/archon-creds`).
+   * Must be called before `start()` — that's where the adapter wires Bolt's
+   * `app.command()` so the receiver knows about the command.
+   *
+   * Authorization: the same allowlist used for messages is enforced before
+   * the handler runs. Unauthorized invocations get a silent ephemeral reply
+   * with no leakage of whether the bot is configured.
+   */
+  onSlashCommand(name: string, handler: SlashCommandHandler): void {
+    if (!name.startsWith('/')) {
+      throw new Error(`Slash command name must start with "/" — got "${name}"`);
+    }
+    if (this.slashHandlers.has(name)) {
+      throw new Error(`Slash command already registered: ${name}`);
+    }
+    this.slashHandlers.set(name, handler);
+  }
+
+  /**
+   * Wire every registered slash-command handler into Bolt. Called from
+   * `start()` exactly once; idempotent because `onSlashCommand()` rejects
+   * duplicate names.
+   */
+  private registerSlashCommandsInternal(): void {
+    for (const [name, handler] of this.slashHandlers.entries()) {
+      this.app.command(name, async ({ command, ack, respond }) => {
+        // Bolt requires ack within 3s; respond with the actual answer
+        // separately so handlers can do real work without blocking ack.
+        await ack();
+        try {
+          const userId = command.user_id;
+          if (!isSlackUserAuthorized(userId, this.allowedUserIds)) {
+            const masked = userId ? `${userId.slice(0, 4)}***` : 'unknown';
+            getLog().info(
+              { name, maskedUserId: masked },
+              'slack.unauthorized_slash_command'
+            );
+            await respond({
+              response_type: 'ephemeral',
+              text: 'You are not authorized to use this command.',
+            });
+            return;
+          }
+          const isDM = command.channel_name === 'directmessage';
+          const text = command.text ?? '';
+          const result = await handler(userId, text, isDM);
+          await respond({
+            response_type: result.ephemeral === false ? 'in_channel' : 'ephemeral',
+            text: result.replyText,
+          });
+        } catch (err) {
+          // Bolt will log this too, but a structured log line lives with our
+          // other slack.* events for grep-ability.
+          getLog().error({ err, name }, 'slack.slash_command_handler_failed');
+          await respond({
+            response_type: 'ephemeral',
+            text: 'The command failed unexpectedly. Check server logs for details.',
+          });
+        }
+      });
+    }
+  }
+
+  /**
    * Start the bot (connects via Socket Mode)
    */
   async start(): Promise<void> {
+    // Wire all registered slash commands into Bolt before the socket connects.
+    // (Socket Mode picks up commands as the receiver dispatches them, so the
+    // registration order vs. start() doesn't strictly matter — but doing it
+    // here keeps the `onSlashCommand()` API symmetric with `onMessage()`.)
+    this.registerSlashCommandsInternal();
+
     // Register app_mention event handler (when bot is @mentioned)
     this.app.event('app_mention', async ({ event }) => {
       // Authorization check

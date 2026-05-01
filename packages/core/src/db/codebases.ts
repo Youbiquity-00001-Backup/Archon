@@ -17,11 +17,25 @@ export async function createCodebase(data: {
   repository_url?: string;
   default_cwd: string;
   ai_assistant_type?: string;
+  /**
+   * Slack/platform user id of whoever triggered this registration. Optional —
+   * legacy callers (CLI, /register-project) leave it null.
+   */
+  registered_by_slack_user_id?: string | null;
 }): Promise<Codebase> {
   const assistantType = data.ai_assistant_type ?? 'claude';
+  const dialect = getDialect();
+  const registeredBy = data.registered_by_slack_user_id ?? null;
+  // Set registered_at = now() only when we know the registrar — leaves the
+  // column null on legacy CLI registrations so the migration semantics
+  // ("NULL means no self-fallback eligible") stay consistent.
+  const registeredAt = registeredBy ? dialect.now() : 'NULL';
   const result = await pool.query<Codebase>(
-    'INSERT INTO remote_agent_codebases (name, repository_url, default_cwd, ai_assistant_type) VALUES ($1, $2, $3, $4) RETURNING *',
-    [data.name, data.repository_url ?? null, data.default_cwd, assistantType]
+    `INSERT INTO remote_agent_codebases
+       (name, repository_url, default_cwd, ai_assistant_type, registered_by_slack_user_id, registered_at)
+     VALUES ($1, $2, $3, $4, $5, ${registeredAt})
+     RETURNING *`,
+    [data.name, data.repository_url ?? null, data.default_cwd, assistantType, registeredBy]
   );
   if (!result.rows[0]) {
     throw new Error('Failed to create codebase: INSERT succeeded but no row returned');

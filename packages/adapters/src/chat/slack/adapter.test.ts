@@ -29,6 +29,17 @@ const mockReplies = mock(() => Promise.resolve({ messages: [] }));
 const mockEvent = mock(() => {});
 const mockStart = mock(() => Promise.resolve(undefined));
 const mockStop = mock(() => Promise.resolve(undefined));
+// Captured slash-command registrations: name → Bolt handler. Tests fire them
+// directly with a synthetic Bolt context to exercise the adapter's wrapping.
+type BoltSlashHandler = (args: {
+  command: { user_id: string; channel_name?: string; text?: string };
+  ack: () => Promise<void>;
+  respond: (response: { response_type?: string; text: string }) => Promise<void>;
+}) => Promise<void>;
+const slashRegistrations = new Map<string, BoltSlashHandler>();
+const mockCommand = mock((name: string, handler: BoltSlashHandler) => {
+  slashRegistrations.set(name, handler);
+});
 
 const mockApp = {
   client: {
@@ -40,6 +51,7 @@ const mockApp = {
     },
   },
   event: mockEvent,
+  command: mockCommand,
   start: mockStart,
   stop: mockStop,
 };
@@ -363,6 +375,111 @@ describe('SlackAdapter', () => {
         expect.objectContaining({
           blocks: [{ type: 'markdown', text: '' }],
         })
+      );
+    });
+  });
+
+  describe('slash commands (onSlashCommand + start wiring)', () => {
+    let adapter: SlackAdapter;
+    const ack = mock(async () => undefined);
+
+    beforeEach(() => {
+      adapter = new SlackAdapter('xoxb-fake', 'xapp-fake');
+      slashRegistrations.clear();
+      mockCommand.mockClear();
+      ack.mockClear();
+    });
+
+    test('rejects names without a leading slash', () => {
+      expect(() => adapter.onSlashCommand('archon-creds', async () => ({ replyText: 'x' }))).toThrow(
+        /must start with/
+      );
+    });
+
+    test('refuses duplicate registrations', () => {
+      adapter.onSlashCommand('/archon-creds', async () => ({ replyText: 'x' }));
+      expect(() =>
+        adapter.onSlashCommand('/archon-creds', async () => ({ replyText: 'y' }))
+      ).toThrow(/already registered/);
+    });
+
+    test('start() wires every registration into Bolt', async () => {
+      adapter.onSlashCommand('/archon-creds', async () => ({ replyText: 'a' }));
+      adapter.onSlashCommand('/archon-codebase', async () => ({ replyText: 'b' }));
+      await adapter.start();
+      expect(slashRegistrations.has('/archon-creds')).toBe(true);
+      expect(slashRegistrations.has('/archon-codebase')).toBe(true);
+    });
+
+    test('handler reply is forwarded ephemerally by default', async () => {
+      const handler = mock(async (uid: string, text: string, isDM: boolean) => {
+        expect(uid).toBe('U_TEST');
+        expect(text).toBe('anthropic abc');
+        expect(isDM).toBe(true);
+        return { replyText: 'ok' };
+      });
+      adapter.onSlashCommand('/archon-creds', handler);
+      await adapter.start();
+
+      const wired = slashRegistrations.get('/archon-creds');
+      expect(wired).toBeDefined();
+      const respond = mock(async () => undefined);
+      await wired?.({
+        command: {
+          user_id: 'U_TEST',
+          channel_name: 'directmessage',
+          text: 'anthropic abc',
+        },
+        ack,
+        respond,
+      });
+      expect(ack).toHaveBeenCalledTimes(1);
+      expect(respond).toHaveBeenCalledWith({ response_type: 'ephemeral', text: 'ok' });
+      expect(handler).toHaveBeenCalledTimes(1);
+    });
+
+    test('rejects unauthorized users when allowlist is configured', async () => {
+      const original = process.env.SLACK_ALLOWED_USER_IDS;
+      process.env.SLACK_ALLOWED_USER_IDS = 'U_AUTHED';
+      try {
+        const adapter2 = new SlackAdapter('xoxb-fake', 'xapp-fake');
+        const handler = mock(async () => ({ replyText: 'should not fire' }));
+        adapter2.onSlashCommand('/archon-creds', handler);
+        await adapter2.start();
+        const wired = slashRegistrations.get('/archon-creds');
+        const respond = mock(async () => undefined);
+        await wired?.({
+          command: { user_id: 'U_OTHER', channel_name: 'directmessage', text: '' },
+          ack,
+          respond,
+        });
+        expect(handler).not.toHaveBeenCalled();
+        expect(respond).toHaveBeenCalledWith(
+          expect.objectContaining({ text: expect.stringMatching(/not authorized/) })
+        );
+      } finally {
+        if (original === undefined) delete process.env.SLACK_ALLOWED_USER_IDS;
+        else process.env.SLACK_ALLOWED_USER_IDS = original;
+      }
+    });
+
+    test('handler errors are logged and surfaced as a generic ephemeral reply', async () => {
+      const handler = mock(async () => {
+        throw new Error('boom');
+      });
+      adapter.onSlashCommand('/archon-creds', handler);
+      await adapter.start();
+      const wired = slashRegistrations.get('/archon-creds');
+      const respond = mock(async () => undefined);
+      await wired?.({
+        command: { user_id: 'U_TEST', channel_name: 'directmessage', text: '' },
+        ack,
+        respond,
+      });
+      // The handler ran (and threw), but the user sees a generic message.
+      expect(handler).toHaveBeenCalledTimes(1);
+      expect(respond).toHaveBeenCalledWith(
+        expect.objectContaining({ response_type: 'ephemeral', text: expect.any(String) })
       );
     });
   });

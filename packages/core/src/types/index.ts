@@ -68,6 +68,16 @@ export interface Codebase {
   default_cwd: string;
   ai_assistant_type: string;
   commands: Record<string, { path: string; description: string }>;
+  /**
+   * Platform user id (e.g. Slack user id) of whoever registered this codebase.
+   * Drives the self-fallback rule in `UserCredsService.selfFallbackToken` —
+   * the registering user's stored GitHub creds are eligible for THEIR own
+   * future actions on this codebase. Never used for cross-user borrowing.
+   * Null on rows that predate Patch 3 / Phase A.1.
+   */
+  registered_by_slack_user_id: string | null;
+  /** Set on insert when a registrar is known; null on legacy rows. */
+  registered_at: Date | null;
   created_at: Date;
   updated_at: Date;
 }

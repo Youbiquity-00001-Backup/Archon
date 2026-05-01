@@ -76,7 +76,12 @@ export { buildOrchestratorPrompt, buildProjectScopedPrompt } from './orchestrato
 // Handlers
 // =============================================================================
 export { handleCommand, parseCommand } from './handlers/command-handler';
-export { cloneRepository, registerRepository, type RegisterResult } from './handlers/clone';
+export {
+  cloneRepository,
+  registerRepository,
+  type RegisterResult,
+  type RegisterOptions,
+} from './handlers/clone';
 
 // =============================================================================
 // Config
@@ -110,6 +115,26 @@ export {
 } from './services/cleanup-service';
 
 export { generateAndSetTitle } from './services/title-generator';
+
+// Per-user credential service (Slack ID → cached env overlay + secret-store
+// upserts). Wired into the orchestrator hot path via `getEnvOverlay()`.
+export {
+  UserCredsService,
+  InMemorySecretStore,
+  setUserCredsService,
+  getUserCredsService,
+} from './services/user-creds';
+export type {
+  ISecretStore,
+  UserCreds,
+  UserEnvOverlay,
+  AnthropicCreds,
+  GithubCreds,
+  UpsertResult,
+  UserCredsServiceOptions,
+  AnthropicProbe,
+  GithubProbe,
+} from './services/user-creds';
 
 // =============================================================================
 // State

@@ -53,6 +53,7 @@ import * as messageDb from '../db/messages';
 import * as workflowDb from '../db/workflows';
 import * as workflowEventDb from '../db/workflow-events';
 import { getCodebaseEnvVars } from '../db/env-vars';
+import { getUserCredsService } from '../services/user-creds';
 import type { ApprovalContext } from '@archon/workflows/schemas/workflow-run';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -857,13 +858,20 @@ export async function handleMessage(
         );
       }
     }
-    // Per-user env overlay: when the message has a known platformUserId and
-    // the merged config has a matching userEnvVars entry, overlay those vars
-    // at highest precedence. Used primarily for per-user Anthropic OAuth via
-    // a per-user HOME pointing at <home>/.claude/.credentials.json.
+    // Per-user env overlay precedence: live `UserCredsService` (Patch 3,
+    // backed by Secrets Manager / per-user uploads) wins over the static
+    // `config.userEnvVars` map (Patch 1, YAML-mounted). The live service is
+    // only present when the server has bootstrapped one — CLI and isolated
+    // tests fall back to the static map.
+    const userCreds = getUserCredsService();
+    const liveOverlay =
+      platformUserId && userCreds ? (userCreds.getEnvOverlay(platformUserId) ?? null) : null;
     const userEnvVarsMap = config.userEnvVars ?? {};
-    const userOverlay =
-      platformUserId && userEnvVarsMap[platformUserId] ? userEnvVarsMap[platformUserId] : {};
+    const staticOverlay =
+      !liveOverlay && platformUserId && userEnvVarsMap[platformUserId]
+        ? userEnvVarsMap[platformUserId]
+        : {};
+    const userOverlay = liveOverlay ?? staticOverlay;
     const effectiveEnv = { ...(config.envVars ?? {}), ...dbEnvVars, ...userOverlay };
 
     // Warn if provider doesn't support env injection but env vars are configured

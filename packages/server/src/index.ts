@@ -75,8 +75,19 @@ import {
   loadConfig,
   logConfig,
   getPort,
+  UserCredsService,
+  setUserCredsService,
+  cloneRepository,
+  codebaseDb,
 } from '@archon/core';
 import type { IPlatformAdapter } from '@archon/core';
+import { InMemoryOAuthStateStore } from './oauth-state-store';
+import {
+  buildGithubAuthorizeUrl,
+  handleGithubOAuthCallback,
+  handleGithubOAuthInitiate,
+  type GithubOAuthConfig,
+} from './auth-github';
 import {
   createLogger,
   logArchonPaths,
@@ -232,6 +243,38 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   const maxConcurrent = parseInt(process.env.MAX_CONCURRENT_CONVERSATIONS ?? '10');
   const lockManager = new ConversationLockManager(maxConcurrent);
   getLog().info({ maxConcurrent }, 'lock_manager_initialized');
+
+  // Patch 3 / Phase A.1: bootstrap the per-user creds service. Runs before
+  // any platform adapter so the orchestrator's env-overlay lookup sees a
+  // populated cache. The default in-memory store is fine for single-task
+  // local dev — production AWS deployments wire an `ISecretStore` backed
+  // by Secrets Manager from the deployment package.
+  const userCreds = new UserCredsService();
+  await userCreds.bootstrap();
+  setUserCredsService(userCreds);
+
+  // OAuth state store for `/archon-creds github`. Process-local; multi-task
+  // deployments will route the callback to the same task that minted the
+  // state because Phase A.1 is single-task. A.2 swaps for a shared store.
+  const oauthStateStore = new InMemoryOAuthStateStore();
+
+  // GitHub OAuth config — sourced from env vars in Phase A.1. Production
+  // deployments hydrate these from Secrets Manager `<prefix>/github-app`
+  // and inject via task definition env vars. Absent values disable the
+  // flow gracefully (slash command returns a config-not-set message).
+  const githubOAuthConfig: GithubOAuthConfig | null =
+    process.env.GITHUB_OAUTH_CLIENT_ID &&
+    process.env.GITHUB_OAUTH_CLIENT_SECRET &&
+    process.env.OAUTH_CALLBACK_BASE
+      ? {
+          clientId: process.env.GITHUB_OAUTH_CLIENT_ID,
+          clientSecret: process.env.GITHUB_OAUTH_CLIENT_SECRET,
+          callbackBase: process.env.OAUTH_CALLBACK_BASE,
+        }
+      : null;
+  if (!githubOAuthConfig) {
+    getLog().info('github_oauth_disabled');
+  }
 
   // Initialize web adapter (always enabled)
   // Note: Circular references between transport/persistence/workflowBridge are safe because:
@@ -421,6 +464,135 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       );
       const slackAdapter = slack; // Capture for use in callback
 
+      // Patch 3 / Phase A.1 slash commands. Registered before `start()` so
+      // Bolt picks them up alongside the message handler. All replies are
+      // ephemeral by default — these flows handle credentials, the user
+      // never wants the channel to see them.
+
+      slackAdapter.onSlashCommand('/archon-creds', async (slackUserId, text, isDM) => {
+        const trimmed = text.trim();
+        const [sub, ...rest] = trimmed.split(/\s+/);
+        const argText = rest.join(' ').trim();
+
+        if (sub === 'anthropic') {
+          if (!isDM) {
+            return {
+              replyText:
+                'Run this in a DM with me — channels are public, your `.credentials.json` is not.',
+            };
+          }
+          if (!argText) {
+            return {
+              replyText:
+                'Usage: `/archon-creds anthropic <paste credentials.json contents>` ' +
+                '(run `claude /login` to refresh first).',
+            };
+          }
+          const result = await userCreds.upsertAnthropic(slackUserId, argText);
+          return { replyText: result.replyText };
+        }
+
+        if (sub === 'github') {
+          if (!githubOAuthConfig) {
+            return {
+              replyText:
+                'GitHub OAuth is not configured on this Archon. Ask the operator to set ' +
+                '`GITHUB_OAUTH_CLIENT_ID`, `GITHUB_OAUTH_CLIENT_SECRET`, and `OAUTH_CALLBACK_BASE`.',
+            };
+          }
+          const url = buildGithubAuthorizeUrl({
+            config: githubOAuthConfig,
+            stateStore: oauthStateStore,
+            slackUserId,
+          });
+          return {
+            replyText:
+              `Click to link GitHub: <${url}|Authorize Archon> (link expires in 10 minutes).`,
+          };
+        }
+
+        return {
+          replyText: 'Usage: `/archon-creds anthropic <json>` or `/archon-creds github`.',
+        };
+      });
+
+      slackAdapter.onSlashCommand('/archon-codebase', async (slackUserId, text) => {
+        const [sub, ...rest] = text.trim().split(/\s+/);
+        const arg = rest.join(' ').trim();
+
+        if (sub === 'add') {
+          if (!arg) {
+            return { replyText: 'Usage: `/archon-codebase add <owner/repo>`' };
+          }
+          const overlay = userCreds.getEnvOverlay(slackUserId);
+          if (!overlay?.GH_TOKEN) {
+            return {
+              replyText:
+                'You have not linked GitHub yet. Run `/archon-creds github` first, then retry.',
+            };
+          }
+          const isUrl = arg.includes('://') || arg.startsWith('git@');
+          const repoSpec = isUrl ? arg : `https://github.com/${arg}`;
+          try {
+            const result = await cloneRepository(repoSpec, {
+              registeredBy: slackUserId,
+              env: { HOME: overlay.HOME, GH_TOKEN: overlay.GH_TOKEN },
+            });
+            return {
+              replyText: result.alreadyExisted
+                ? `\`${result.name}\` is already registered (path: ${result.defaultCwd}).`
+                : `Registered \`${result.name}\` (id: ${result.codebaseId}, ${String(result.commandCount)} commands loaded).`,
+            };
+          } catch (err) {
+            const message = (err as Error).message ?? 'unknown error';
+            return { replyText: `Could not register codebase: ${message}` };
+          }
+        }
+
+        if (sub === 'list') {
+          const codebases = await codebaseDb.listCodebases();
+          if (codebases.length === 0) {
+            return { replyText: 'No codebases registered yet.' };
+          }
+          const lines = codebases.map(cb => {
+            const registrar = cb.registered_by_slack_user_id
+              ? ` (registered by <@${cb.registered_by_slack_user_id}>)`
+              : '';
+            return `• \`${cb.name}\`${registrar}`;
+          });
+          return { replyText: lines.join('\n') };
+        }
+
+        if (sub === 'remove') {
+          if (!arg) {
+            return { replyText: 'Usage: `/archon-codebase remove <owner/repo>`' };
+          }
+          const codebase = await codebaseDb.findCodebaseByName(arg);
+          if (!codebase) {
+            return { replyText: `No codebase named \`${arg}\`.` };
+          }
+          // Strict: only the registrar (or operator-managed legacy rows with
+          // null registrar) can remove. Cross-user removal is intentionally
+          // rejected — same principle as the no-cross-user-borrowing rule.
+          if (
+            codebase.registered_by_slack_user_id &&
+            codebase.registered_by_slack_user_id !== slackUserId
+          ) {
+            return {
+              replyText:
+                `\`${arg}\` was registered by another user; only they can remove it.`,
+            };
+          }
+          await codebaseDb.deleteCodebase(codebase.id);
+          return { replyText: `Removed \`${arg}\`.` };
+        }
+
+        return {
+          replyText:
+            'Usage: `/archon-codebase add <owner/repo>` | `list` | `remove <owner/repo>`',
+        };
+      });
+
       // Register message handler
       slackAdapter.onMessage(async event => {
         const conversationId = slackAdapter.getConversationId(event);
@@ -566,6 +738,39 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     });
     getLog().info('gitlab_webhook_registered');
   }
+
+  // Patch 3 / Phase A.1: GitHub user-to-server OAuth callback. Registered
+  // unconditionally so the URL is stable; if `githubOAuthConfig` is null
+  // (operator hasn't set the env vars) the handler responds 503 explaining
+  // the misconfiguration. The slash-command flow blocks earlier, so the only
+  // way to hit a 503 here is by typing the URL directly.
+  //
+  // This route MUST stay in the ALB OIDC bypass list (Patch 4 infra) — the
+  // GitHub redirect cannot carry a Slack OIDC cookie.
+  app.get('/auth/github/callback', async c => {
+    if (!githubOAuthConfig) {
+      getLog().warn('auth.github.callback_no_config');
+      return c.json({ error: 'github oauth not configured' }, 503);
+    }
+    return handleGithubOAuthCallback(c, {
+      config: githubOAuthConfig,
+      stateStore: oauthStateStore,
+      userCreds,
+    });
+  });
+
+  app.get('/auth/github/initiate', async c => {
+    if (!githubOAuthConfig) {
+      return c.json({ error: 'github oauth not configured' }, 503);
+    }
+    return handleGithubOAuthInitiate(c, {
+      config: githubOAuthConfig,
+      stateStore: oauthStateStore,
+      // Phase A.1 has no OIDC middleware, so unauthenticated callers get 401
+      // here. Patch 4 will wire `c.get('identity')` through.
+      resolveSlackUserId: async () => null,
+    });
+  });
 
   // Health check endpoints
   app.get('/health', c => {

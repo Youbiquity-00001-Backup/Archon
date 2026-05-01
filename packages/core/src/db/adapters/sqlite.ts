@@ -215,6 +215,26 @@ export class SqliteAdapter implements IDatabase {
     } catch (e: unknown) {
       getLog().warn({ err: e as Error }, 'db.sqlite_migration_session_columns_failed');
     }
+
+    // Codebase registration columns (Patch 3 / Phase A.1).
+    // Mirrors migrations/022_codebase_registration.sql for SQLite installs.
+    try {
+      const cbCols = this.db.prepare("PRAGMA table_info('remote_agent_codebases')").all() as {
+        name: string;
+      }[];
+      const cbColNames = new Set(cbCols.map(c => c.name));
+
+      if (!cbColNames.has('registered_by_slack_user_id')) {
+        this.db.run(
+          'ALTER TABLE remote_agent_codebases ADD COLUMN registered_by_slack_user_id TEXT'
+        );
+      }
+      if (!cbColNames.has('registered_at')) {
+        this.db.run('ALTER TABLE remote_agent_codebases ADD COLUMN registered_at TEXT');
+      }
+    } catch (e: unknown) {
+      getLog().warn({ err: e as Error }, 'db.sqlite_migration_codebase_columns_failed');
+    }
   }
 
   /**
@@ -237,6 +257,8 @@ export class SqliteAdapter implements IDatabase {
         default_branch TEXT DEFAULT 'main',
         ai_assistant_type TEXT DEFAULT 'claude',
         commands TEXT DEFAULT '{}',
+        registered_by_slack_user_id TEXT,
+        registered_at TEXT,
         created_at TEXT DEFAULT (datetime('now')),
         updated_at TEXT DEFAULT (datetime('now'))
       );

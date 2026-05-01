@@ -37,9 +37,20 @@ describe('codebases', () => {
     default_cwd: '/workspace/test-project',
     ai_assistant_type: 'claude',
     commands: { plan: { path: '.claude/commands/plan.md', description: 'Plan feature' } },
+    registered_by_slack_user_id: null,
+    registered_at: null,
     created_at: new Date(),
     updated_at: new Date(),
   };
+
+  // Match the multi-line SQL literal that createCodebase emits. The 6th column
+  // is interpolated as either dialect.now() (when registrar is set) or the
+  // literal `NULL`; tests below assert the no-registrar branch where it's NULL.
+  const expectedInsertSqlNullRegistered =
+    `INSERT INTO remote_agent_codebases\n` +
+    `       (name, repository_url, default_cwd, ai_assistant_type, registered_by_slack_user_id, registered_at)\n` +
+    `     VALUES ($1, $2, $3, $4, $5, NULL)\n` +
+    `     RETURNING *`;
 
   describe('createCodebase', () => {
     test('creates codebase with all fields', async () => {
@@ -53,10 +64,13 @@ describe('codebases', () => {
       });
 
       expect(result).toEqual(mockCodebase);
-      expect(mockQuery).toHaveBeenCalledWith(
-        'INSERT INTO remote_agent_codebases (name, repository_url, default_cwd, ai_assistant_type) VALUES ($1, $2, $3, $4) RETURNING *',
-        ['test-project', 'https://github.com/user/repo', '/workspace/test-project', 'claude']
-      );
+      expect(mockQuery).toHaveBeenCalledWith(expectedInsertSqlNullRegistered, [
+        'test-project',
+        'https://github.com/user/repo',
+        '/workspace/test-project',
+        'claude',
+        null,
+      ]);
     });
 
     test('creates codebase with optional fields omitted', async () => {
@@ -72,10 +86,39 @@ describe('codebases', () => {
       });
 
       expect(result).toEqual(codebaseWithoutOptional);
-      expect(mockQuery).toHaveBeenCalledWith(
-        'INSERT INTO remote_agent_codebases (name, repository_url, default_cwd, ai_assistant_type) VALUES ($1, $2, $3, $4) RETURNING *',
-        ['test-project', null, '/workspace/test-project', 'claude']
-      );
+      expect(mockQuery).toHaveBeenCalledWith(expectedInsertSqlNullRegistered, [
+        'test-project',
+        null,
+        '/workspace/test-project',
+        'claude',
+        null,
+      ]);
+    });
+
+    test('records registrar id and uses dialect.now() for registered_at', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([mockCodebase]));
+
+      await createCodebase({
+        name: 'test-project',
+        default_cwd: '/workspace/test-project',
+        registered_by_slack_user_id: 'U_REGISTRAR',
+      });
+
+      // mockPostgresDialect.now() returns 'NOW()'; when the registrar is
+      // present, that gets interpolated into the SQL where NULL would
+      // otherwise sit.
+      const expectedSql =
+        `INSERT INTO remote_agent_codebases\n` +
+        `       (name, repository_url, default_cwd, ai_assistant_type, registered_by_slack_user_id, registered_at)\n` +
+        `     VALUES ($1, $2, $3, $4, $5, NOW())\n` +
+        `     RETURNING *`;
+      expect(mockQuery).toHaveBeenCalledWith(expectedSql, [
+        'test-project',
+        null,
+        '/workspace/test-project',
+        'claude',
+        'U_REGISTRAR',
+      ]);
     });
 
     test('defaults ai_assistant_type to claude', async () => {

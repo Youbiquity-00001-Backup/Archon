@@ -17,6 +17,8 @@ export const codebaseSchema = z
     default_cwd: z.string(),
     ai_assistant_type: z.string(),
     commands: z.record(codebaseCommandSchema),
+    registered_by_slack_user_id: z.string().nullable(),
+    registered_at: z.string().nullable(),
     created_at: z.string(),
     updated_at: z.string(),
   })

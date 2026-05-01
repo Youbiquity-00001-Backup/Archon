@@ -35,12 +35,32 @@ export interface RegisterResult {
 }
 
 /**
+ * Optional per-call context for clone/register. Carries the registering
+ * user's identity (so the codebase row records who registered it for the
+ * self-fallback rule) and an env overlay (used to prefer the registering
+ * user's `GH_TOKEN` and `HOME`-scoped `.git-credentials` over the process
+ * env when shelling out to `git clone`).
+ */
+export interface RegisterOptions {
+  /** Slack/platform user id of the requesting user, if known. */
+  registeredBy?: string | null;
+  /**
+   * Env overlay to apply to the underlying `git` invocations. `HOME` makes
+   * git pick up the user's `.git-credentials`; `GH_TOKEN` is used as a
+   * fallback when constructing an authenticated clone URL. Tests pass
+   * empty objects.
+   */
+  env?: NodeJS.ProcessEnv;
+}
+
+/**
  * Shared logic: register a repo at a given path in the DB and load commands.
  */
 async function registerRepoAtPath(
   targetPath: string,
   name: string,
-  repositoryUrl: string | null
+  repositoryUrl: string | null,
+  options?: RegisterOptions
 ): Promise<RegisterResult> {
   // Auto-detect assistant type based on SDK folder conventions.
   // Built-in providers use well-known folders (.claude/, .codex/).
@@ -126,6 +146,7 @@ async function registerRepoAtPath(
     repository_url: repositoryUrl ?? undefined,
     default_cwd: targetPath,
     ai_assistant_type: suggestedAssistant,
+    registered_by_slack_user_id: options?.registeredBy ?? null,
   });
 
   // Auto-load commands if found
@@ -193,12 +214,20 @@ function normalizeRepoUrl(rawUrl: string): {
  * Clone a repository from a URL and register it in the database.
  * Local paths (starting with /, ~, or .) are delegated to registerRepository
  * to avoid wrong owner/repo naming. See #383 for broader rethink.
+ *
+ * Patch 3 / Phase A.1: `options.registeredBy` records the requesting Slack
+ * user on the codebase row; `options.env` lets the caller thread the user's
+ * `HOME` (so per-user `.git-credentials` are picked up by `git clone`) and
+ * `GH_TOKEN` (used as a fallback when the user has no `.git-credentials`).
  */
-export async function cloneRepository(repoUrl: string): Promise<RegisterResult> {
+export async function cloneRepository(
+  repoUrl: string,
+  options?: RegisterOptions
+): Promise<RegisterResult> {
   // Local paths should be registered (symlink), not cloned (copied)
   if (repoUrl.startsWith('/') || repoUrl.startsWith('~') || repoUrl.startsWith('.')) {
     const resolvedPath = repoUrl.startsWith('~') ? expandTilde(repoUrl) : resolve(repoUrl);
-    return registerRepository(resolvedPath);
+    return registerRepository(resolvedPath, options);
   }
 
   const { workingUrl, ownerName, repoName, targetPath } = normalizeRepoUrl(repoUrl);
@@ -243,9 +272,12 @@ export async function cloneRepository(repoUrl: string): Promise<RegisterResult> 
 
   getLog().info({ url: workingUrl, targetPath }, 'clone_started');
 
-  // Build clone command with authentication if GitHub token is available
+  // Build clone command with authentication if GitHub token is available.
+  // Per-user `GH_TOKEN` from `options.env` wins over `process.env.GH_TOKEN` —
+  // the requesting user's identity is more specific than any deployment-wide
+  // fallback and prevents accidental cross-user borrowing.
   let cloneUrl = workingUrl;
-  const ghToken = process.env.GH_TOKEN;
+  const ghToken = options?.env?.GH_TOKEN ?? process.env.GH_TOKEN;
 
   if (ghToken && workingUrl.includes('github.com')) {
     if (workingUrl.startsWith('https://github.com')) {
@@ -268,8 +300,12 @@ export async function cloneRepository(repoUrl: string): Promise<RegisterResult> 
     }
   }
 
+  // Per-user `HOME` is threaded through so any `.git-credentials` materialized
+  // by `UserCredsService` in that home dir take effect for this clone too —
+  // belt-and-suspenders alongside the in-URL token auth above.
+  const cloneEnv = options?.env ? { ...process.env, ...options.env } : undefined;
   try {
-    await execFileAsync('git', ['clone', cloneUrl, targetPath]);
+    await execFileAsync('git', ['clone', cloneUrl, targetPath], { env: cloneEnv });
   } catch (error) {
     const safeErr = sanitizeError(error as Error);
     throw new Error(`Failed to clone repository: ${safeErr.message}`);
@@ -279,15 +315,27 @@ export async function cloneRepository(repoUrl: string): Promise<RegisterResult> 
   await execFileAsync('git', ['config', '--global', '--add', 'safe.directory', targetPath]);
   getLog().debug({ path: targetPath }, 'safe_directory_added');
 
-  const result = await registerRepoAtPath(targetPath, `${ownerName}/${repoName}`, workingUrl);
+  const result = await registerRepoAtPath(
+    targetPath,
+    `${ownerName}/${repoName}`,
+    workingUrl,
+    options
+  );
   getLog().info({ url: workingUrl, targetPath }, 'clone_completed');
   return result;
 }
 
 /**
  * Register an existing local repository in the database (no git clone).
+ *
+ * `options.registeredBy` is recorded on the codebase row when set;
+ * `options.env` is currently unused (no clone happens) but accepted for
+ * call-site symmetry with `cloneRepository`.
  */
-export async function registerRepository(localPath: string): Promise<RegisterResult> {
+export async function registerRepository(
+  localPath: string,
+  options?: RegisterOptions
+): Promise<RegisterResult> {
   // Validate path exists and is a git repo
   try {
     await execFileAsync('git', ['-C', localPath, 'rev-parse', '--git-dir']);
@@ -353,5 +401,5 @@ export async function registerRepository(localPath: string): Promise<RegisterRes
   );
 
   // default_cwd is the real local path (not the symlink)
-  return registerRepoAtPath(localPath, name, remoteUrl);
+  return registerRepoAtPath(localPath, name, remoteUrl, options);
 }
