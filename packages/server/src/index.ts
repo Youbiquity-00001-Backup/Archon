@@ -89,6 +89,11 @@ import {
   type GithubOAuthConfig,
 } from './auth-github';
 import {
+  createOidcMiddleware,
+  getIdentity,
+  parseAllowedSlackUserIds,
+} from './middleware/oidc-identity';
+import {
   createLogger,
   logArchonPaths,
   validateAppDefaultsPaths,
@@ -506,8 +511,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
             slackUserId,
           });
           return {
-            replyText:
-              `Click to link GitHub: <${url}|Authorize Archon> (link expires in 10 minutes).`,
+            replyText: `Click to link GitHub: <${url}|Authorize Archon> (link expires in 10 minutes).`,
           };
         }
 
@@ -579,8 +583,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
             codebase.registered_by_slack_user_id !== slackUserId
           ) {
             return {
-              replyText:
-                `\`${arg}\` was registered by another user; only they can remove it.`,
+              replyText: `\`${arg}\` was registered by another user; only they can remove it.`,
             };
           }
           await codebaseDb.deleteCodebase(codebase.id);
@@ -588,8 +591,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         }
 
         return {
-          replyText:
-            'Usage: `/archon-codebase add <owner/repo>` | `list` | `remove <owner/repo>`',
+          replyText: 'Usage: `/archon-codebase add <owner/repo>` | `list` | `remove <owner/repo>`',
         };
       });
 
@@ -650,6 +652,31 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     getLog().error({ err, path: c.req.path, method: c.req.method }, 'unhandled_request_error');
     return c.json({ error: 'Internal server error' }, 500);
   });
+
+  // Patch 4 / Phase A.1: ALB OIDC identity enforcement on the Web UI API.
+  // Wired only when `ALB_OIDC_REGION` is set — production deployments behind
+  // ALB with the `authenticate-oidc` action. In local dev (env var unset)
+  // the middleware is skipped entirely, so `bun run dev` does not require
+  // a fake JWT. `SLACK_ALLOWED_USER_IDS` reuses the chat allowlist; an
+  // empty allowlist means deny-all on the web tier (no implicit "open"
+  // mode in production).
+  //
+  // Registration MUST come before `registerApiRoutes(...)` — Hono middleware
+  // and routes execute in registration order, and route handlers do not
+  // call `next()`, so middleware registered after routes never runs.
+  // CORS still registers inside `registerApiRoutes` and runs second; the
+  // OIDC middleware passes through CORS preflight (OPTIONS) on purpose so
+  // the cors() handler downstream can answer those normally.
+  if (process.env.ALB_OIDC_REGION) {
+    const oidcMw = createOidcMiddleware({
+      region: process.env.ALB_OIDC_REGION,
+      allowedSlackUserIds: parseAllowedSlackUserIds(process.env.SLACK_ALLOWED_USER_IDS),
+    });
+    app.use('/api/*', oidcMw);
+    getLog().info({ region: process.env.ALB_OIDC_REGION }, 'auth.oidc.middleware_enabled');
+  } else {
+    getLog().info('auth.oidc.middleware_disabled');
+  }
 
   // Register Web UI API routes
   registerApiRoutes(app, webAdapter, lockManager, activePlatforms);
@@ -759,6 +786,23 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     });
   });
 
+  // /auth/github/initiate is the SPA's entry to the GitHub OAuth flow.
+  // It needs the requesting Slack user id, which Patch 4's OIDC middleware
+  // attaches via `c.set('identity', ...)`. When the middleware is disabled
+  // (local dev), `getIdentity()` returns undefined and the handler 401s.
+  // We deliberately do NOT apply the OIDC middleware to this route directly
+  // — `/auth/github/initiate` is under `/auth/*`, not `/api/*`, but the
+  // initiate flow always originates from the SPA so the user has an OIDC
+  // session by the time the SPA fires this XHR. We re-verify here via
+  // `getIdentity` rather than pretending the route is unauthenticated.
+  if (process.env.ALB_OIDC_REGION) {
+    const oidcMw = createOidcMiddleware({
+      region: process.env.ALB_OIDC_REGION,
+      allowedSlackUserIds: parseAllowedSlackUserIds(process.env.SLACK_ALLOWED_USER_IDS),
+    });
+    app.use('/auth/github/initiate', oidcMw);
+  }
+
   app.get('/auth/github/initiate', async c => {
     if (!githubOAuthConfig) {
       return c.json({ error: 'github oauth not configured' }, 503);
@@ -766,9 +810,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     return handleGithubOAuthInitiate(c, {
       config: githubOAuthConfig,
       stateStore: oauthStateStore,
-      // Phase A.1 has no OIDC middleware, so unauthenticated callers get 401
-      // here. Patch 4 will wire `c.get('identity')` through.
-      resolveSlackUserId: async () => null,
+      // OIDC middleware (when configured) attaches the verified Slack user
+      // id; in local dev there is no middleware, so `getIdentity` returns
+      // undefined and the handler 401s.
+      resolveSlackUserId: async () => getIdentity(c)?.slackUserId ?? null,
     });
   });
 
