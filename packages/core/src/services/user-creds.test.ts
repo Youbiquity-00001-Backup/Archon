@@ -203,6 +203,65 @@ describe('UserCredsService', () => {
     });
   });
 
+  describe('getConnectionStatus', () => {
+    test('reports both kinds as not linked when no creds are stored', async () => {
+      const svc = newService();
+      const status = await svc.getConnectionStatus('U_NONE');
+      expect(status.anthropic.linked).toBe(false);
+      expect(status.github.linked).toBe(false);
+    });
+
+    test('exposes the captured Anthropic account email but never the access token', async () => {
+      // Override the default probe BEFORE constructing the service, since
+      // `newService()` captures the probe references at construction time.
+      probes.anthropic = async () => ({ ok: true, accountEmail: 'alice@example.com' });
+      const svc = newService();
+      await svc.upsertAnthropic(
+        'U1',
+        JSON.stringify({ claudeAiOauth: { accessToken: 'sk-secret' } })
+      );
+      const status = await svc.getConnectionStatus('U1');
+      // Discriminate the union explicitly so the test fails loudly if
+      // someone changes the shape and ships tokens to the SPA.
+      expect(status.anthropic.linked).toBe(true);
+      if (status.anthropic.linked) {
+        expect(status.anthropic.accountEmail).toBe('alice@example.com');
+      }
+      // Sanity: the JSON shape doesn't include the access token even after
+      // serialization. This is the "safe to send to the SPA" property.
+      const json = JSON.stringify(status);
+      expect(json).not.toContain('sk-secret');
+    });
+
+    test('exposes the GitHub login but never the access token', async () => {
+      probes.github = async () => ({ ok: true, login: 'octocat' });
+      const svc = newService();
+      await svc.upsertGithub('U1', {
+        type: 'oauth',
+        accessToken: 'gho-very-secret',
+        refreshToken: 'ghr-secret',
+      });
+      const status = await svc.getConnectionStatus('U1');
+      expect(status.github.linked).toBe(true);
+      if (status.github.linked) {
+        expect(status.github.login).toBe('octocat');
+      }
+      const json = JSON.stringify(status);
+      expect(json).not.toContain('gho-very-secret');
+      expect(json).not.toContain('ghr-secret');
+    });
+
+    test('treats a corrupt stored doc as "not linked" rather than throwing', async () => {
+      const svc = newService();
+      // Pre-seed the store with garbage; bootstrap would log+skip but we
+      // bypass it here to exercise the runtime fetch path explicitly.
+      store.seed('U_CORRUPT', '{ this is not json');
+      const status = await svc.getConnectionStatus('U_CORRUPT');
+      expect(status.anthropic.linked).toBe(false);
+      expect(status.github.linked).toBe(false);
+    });
+  });
+
   describe('selfFallbackToken', () => {
     test('returns null when codebase has no registrar', async () => {
       const svc = newService();

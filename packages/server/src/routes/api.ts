@@ -27,6 +27,7 @@ import {
   registerRepository,
   ConversationNotFoundError,
   generateAndSetTitle,
+  getUserCredsService,
 } from '@archon/core';
 import { removeWorktree, toRepoPath, toWorktreePath } from '@archon/git';
 import {
@@ -122,6 +123,8 @@ import {
   codebaseEnvironmentsResponseSchema,
 } from './schemas/config.schemas';
 import { providerListResponseSchema } from './schemas/provider.schemas';
+import { identityResponseSchema, connectionsResponseSchema } from './schemas/auth.schemas';
+import { getIdentity } from '../middleware/oidc-identity';
 import { getProviderInfoList, isRegisteredProvider } from '@archon/providers';
 
 // Read app version: use build-time constant in binary, package.json in dev
@@ -537,6 +540,39 @@ const deleteEnvVarRoute = createRoute({
 });
 
 // =========================================================================
+// Auth route configs (Patch 4 / Phase A.1)
+// =========================================================================
+
+const getIdentityRoute = createRoute({
+  method: 'get',
+  path: '/api/auth/identity',
+  tags: ['Auth'],
+  summary: 'Return the current OIDC identity (Slack uid + cosmetic claims)',
+  responses: {
+    200: {
+      content: { 'application/json': { schema: identityResponseSchema } },
+      description: 'Current user identity',
+    },
+    401: jsonError('Unauthenticated'),
+  },
+});
+
+const getConnectionsRoute = createRoute({
+  method: 'get',
+  path: '/api/auth/connections',
+  tags: ['Auth'],
+  summary: 'Per-user link status for Anthropic + GitHub (no token material)',
+  responses: {
+    200: {
+      content: { 'application/json': { schema: connectionsResponseSchema } },
+      description: 'Connection status',
+    },
+    401: jsonError('Unauthenticated'),
+    503: jsonError('UserCredsService not configured'),
+  },
+});
+
+// =========================================================================
 // Workflow run route configs
 // =========================================================================
 
@@ -859,7 +895,7 @@ export function registerApiRoutes(
 ): void {
   function apiError(
     c: Context,
-    status: 400 | 404 | 422 | 500,
+    status: 400 | 401 | 403 | 404 | 422 | 500 | 503,
     message: string,
     detail?: string
   ): Response {
@@ -1652,6 +1688,31 @@ export function registerApiRoutes(
         return apiError(c, 404, 'Codebase not found');
       }
 
+      // Patch 4 / Phase A.1: registrar-only delete. When the OIDC
+      // middleware is active and we know who's asking, only the registrar
+      // (or anyone, for legacy NULL-registrar rows registered before the
+      // column existed) can remove a codebase. Cross-user removal mirrors
+      // the no-cross-user-borrowing rule applied to GitHub creds.
+      //
+      // In dev (no middleware) `getIdentity()` returns undefined and we
+      // skip the check — same posture as the rest of the API.
+      const identity = getIdentity(c);
+      if (
+        identity &&
+        codebase.registered_by_slack_user_id &&
+        codebase.registered_by_slack_user_id !== identity.slackUserId
+      ) {
+        getLog().info(
+          {
+            codebaseId: id,
+            requestingUid: identity.slackUserId,
+            registeredBy: codebase.registered_by_slack_user_id,
+          },
+          'codebase.delete_denied_not_registrar'
+        );
+        return apiError(c, 403, 'Only the registrar can remove this codebase');
+      }
+
       // Clean up isolation environments (worktrees)
       const environments = await isolationEnvDb.listByCodebase(id);
       for (const env of environments) {
@@ -1735,6 +1796,43 @@ export function registerApiRoutes(
       getLog().error({ err: error, codebaseId: id, key }, 'delete_env_var_failed');
       return apiError(c, 500, 'Failed to delete env var');
     }
+  });
+
+  // GET /api/auth/identity - return the current OIDC identity (Patch 4).
+  // 401 when no identity is attached (dev mode without the middleware, or
+  // a request that bypassed it). The route is under /api/* so the OIDC
+  // middleware (when configured) has already gated access — by the time
+  // this handler runs, an identity is guaranteed in production.
+  registerOpenApiRoute(getIdentityRoute, c => {
+    const identity = getIdentity(c);
+    if (!identity) {
+      return apiError(c, 401, 'No OIDC identity on this request');
+    }
+    return c.json({
+      slackUserId: identity.slackUserId,
+      email: identity.email,
+      displayName: identity.displayName,
+    });
+  });
+
+  // GET /api/auth/connections - per-user Anthropic + GitHub link status
+  // (no token material). Drives the Settings → Connections SPA page.
+  registerOpenApiRoute(getConnectionsRoute, async c => {
+    const identity = getIdentity(c);
+    if (!identity) {
+      return apiError(c, 401, 'No OIDC identity on this request');
+    }
+    const userCreds = getUserCredsService();
+    if (!userCreds) {
+      // Service not bootstrapped — should never happen in production where
+      // server/index.ts always installs one. Surface a 503 rather than
+      // pretending the user has nothing linked, since "nothing linked" is
+      // a real user-visible state we don't want to fake.
+      getLog().warn({ slackUserId: identity.slackUserId }, 'auth.connections.service_unavailable');
+      return apiError(c, 503, 'UserCredsService not configured');
+    }
+    const status = await userCreds.getConnectionStatus(identity.slackUserId);
+    return c.json(status);
   });
 
   /**

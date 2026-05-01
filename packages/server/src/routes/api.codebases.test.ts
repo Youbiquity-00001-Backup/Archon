@@ -171,6 +171,8 @@ const MOCK_CODEBASE = {
   default_cwd: '/home/user/projects/my-project',
   ai_assistant_type: 'claude',
   commands: {},
+  registered_by_slack_user_id: null as string | null,
+  registered_at: null as string | null,
   created_at: new Date().toISOString(),
   updated_at: new Date().toISOString(),
 };
@@ -193,8 +195,19 @@ const MOCK_ENV = {
   updated_at: new Date().toISOString(),
 };
 
-function makeApp(): OpenAPIHono {
+function makeApp(opts?: { stubIdentitySlackUid?: string }): OpenAPIHono {
   const app = new OpenAPIHono({ defaultHook: validationErrorHook });
+  // Stub the OIDC middleware: when the test passes `stubIdentitySlackUid`,
+  // every request gets the same identity attached. Mirrors what the real
+  // OIDC middleware does after JWT verification — registered before
+  // routes so it actually runs (per Hono registration-order semantics).
+  if (opts?.stubIdentitySlackUid !== undefined) {
+    const uid = opts.stubIdentitySlackUid;
+    app.use('/api/*', async (c, next) => {
+      c.set('identity', { slackUserId: uid });
+      await next();
+    });
+  }
   const mockWebAdapter = {
     setConversationDbId: mock((_platformId: string, _dbId: string) => {}),
     emitSSE: mock(async () => {}),
@@ -586,6 +599,43 @@ describe('DELETE /api/codebases/:id', () => {
 
     const body = (await response.json()) as { success: boolean };
     expect(body.success).toBe(true);
+  });
+
+  // Patch 4 / Phase A.1: registrar-only delete enforcement.
+  test('403s when a non-registrar tries to delete a registrar-attributed codebase', async () => {
+    mockGetCodebase.mockImplementationOnce(async () => ({
+      ...MOCK_CODEBASE,
+      registered_by_slack_user_id: 'U_REGISTRAR',
+    }));
+    const app = makeApp({ stubIdentitySlackUid: 'U_OTHER' });
+    const response = await app.request('/api/codebases/codebase-uuid-1', { method: 'DELETE' });
+    expect(response.status).toBe(403);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toMatch(/registrar/i);
+    // The actual delete must not have run.
+    expect(mockDeleteCodebase).not.toHaveBeenCalled();
+  });
+
+  test('the registrar themselves can delete their own codebase', async () => {
+    mockGetCodebase.mockImplementationOnce(async () => ({
+      ...MOCK_CODEBASE,
+      registered_by_slack_user_id: 'U_REGISTRAR',
+    }));
+    mockListByCodebase.mockImplementationOnce(async () => []);
+    mockDeleteCodebase.mockImplementationOnce(async () => {});
+    const app = makeApp({ stubIdentitySlackUid: 'U_REGISTRAR' });
+    const response = await app.request('/api/codebases/codebase-uuid-1', { method: 'DELETE' });
+    expect(response.status).toBe(200);
+    expect(mockDeleteCodebase).toHaveBeenCalledWith('codebase-uuid-1');
+  });
+
+  test('legacy rows with no registrar can still be deleted by anyone', async () => {
+    mockGetCodebase.mockImplementationOnce(async () => MOCK_CODEBASE); // registrar = null
+    mockListByCodebase.mockImplementationOnce(async () => []);
+    mockDeleteCodebase.mockImplementationOnce(async () => {});
+    const app = makeApp({ stubIdentitySlackUid: 'U_RANDOM' });
+    const response = await app.request('/api/codebases/codebase-uuid-1', { method: 'DELETE' });
+    expect(response.status).toBe(200);
   });
 
   test('returns 500 when DB delete throws', async () => {

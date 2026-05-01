@@ -41,6 +41,10 @@ export interface CodebaseResponse {
   default_cwd: string;
   ai_assistant_type: string;
   commands: Record<string, { path: string; description: string }>;
+  /** Slack user id of the registrar; null on legacy rows or unauthenticated dev. */
+  registered_by_slack_user_id: string | null;
+  /** ISO timestamp when the registrar was attributed; null when not known. */
+  registered_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -515,6 +519,48 @@ export async function deleteCodebaseEnvVar(
     `/api/codebases/${encodeURIComponent(codebaseId)}/env/${encodeURIComponent(key)}`,
     { method: 'DELETE' }
   );
+}
+
+// Auth (Patch 4 / Phase A.1) — identity attached by ALB OIDC middleware.
+// Both endpoints 401 in local dev (no middleware) so the SPA can render
+// a "not signed in" placeholder cleanly.
+export interface IdentityResponse {
+  slackUserId: string;
+  email?: string;
+  displayName?: string;
+}
+
+export type AnthropicConnection = { linked: false } | { linked: true; accountEmail?: string };
+
+export type GithubConnection =
+  | { linked: false }
+  | { linked: true; login: string; installationId?: number };
+
+export interface ConnectionsResponse {
+  anthropic: AnthropicConnection;
+  github: GithubConnection;
+}
+
+/** Returns the current user identity, or null when not signed in (401). */
+export async function getIdentity(): Promise<IdentityResponse | null> {
+  try {
+    return await fetchJSON<IdentityResponse>('/api/auth/identity');
+  } catch (err) {
+    // 401 in dev / unauthenticated — surface as null so callers don't have
+    // to special-case the error type. Anything else is a real error.
+    if ((err as Error & { status?: number }).status === 401) return null;
+    throw err;
+  }
+}
+
+/** Returns connection status, or null when not signed in (401). */
+export async function getConnections(): Promise<ConnectionsResponse | null> {
+  try {
+    return await fetchJSON<ConnectionsResponse>('/api/auth/connections');
+  } catch (err) {
+    if ((err as Error & { status?: number }).status === 401) return null;
+    throw err;
+  }
 }
 
 // System

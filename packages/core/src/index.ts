@@ -131,6 +131,7 @@ export type {
   AnthropicCreds,
   GithubCreds,
   UpsertResult,
+  ConnectionStatus,
   UserCredsServiceOptions,
   AnthropicProbe,
   GithubProbe,

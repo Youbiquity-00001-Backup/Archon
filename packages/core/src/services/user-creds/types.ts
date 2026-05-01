@@ -61,3 +61,28 @@ export interface UpsertResult {
   /** Whether the upsert wrote anything (vs. validation reject). */
   persisted: boolean;
 }
+
+/**
+ * Public-safe per-user connection status, suitable for the Settings →
+ * Connections SPA page. Each section is a discriminated union on `linked`
+ * — when not linked, no extra fields are present, so a leaked-empty
+ * response can never accidentally include a previously-linked email.
+ */
+export interface ConnectionStatus {
+  anthropic:
+    | { linked: false }
+    | {
+        linked: true;
+        /** Account email captured at upsert time; absent for legacy uploads. */
+        accountEmail?: string;
+      };
+  github:
+    | { linked: false }
+    | {
+        linked: true;
+        /** GitHub login captured at OAuth time. */
+        login: string;
+        /** Optional GitHub App installation id, when captured. */
+        installationId?: number;
+      };
+}

@@ -24,6 +24,7 @@ import type { ISecretStore } from './secret-store';
 import { InMemorySecretStore } from './secret-store';
 import type {
   AnthropicCreds,
+  ConnectionStatus,
   GithubCreds,
   UserCreds,
   UserEnvOverlay,
@@ -147,10 +148,7 @@ export class UserCredsService {
       } catch (err) {
         // Single-user failure must not block the whole bootstrap — log and
         // proceed. The caller can self-heal via `/archon-creds anthropic|github`.
-        getLog().error(
-          { err, slackUserId: maskUid(id) },
-          'user-creds.bootstrap_user_failed'
-        );
+        getLog().error({ err, slackUserId: maskUid(id) }, 'user-creds.bootstrap_user_failed');
       }
     }
     this.bootstrapped = true;
@@ -179,10 +177,7 @@ export class UserCredsService {
    * Anthropic API, persists to the secret store, materializes to disk, and
    * updates the cache.
    */
-  async upsertAnthropic(
-    slackUserId: string,
-    rawJson: string
-  ): Promise<UpsertResult> {
+  async upsertAnthropic(slackUserId: string, rawJson: string): Promise<UpsertResult> {
     const parsed = parseAnthropicJson(rawJson);
     if (!parsed.ok) {
       return { replyText: parsed.error, persisted: false };
@@ -245,6 +240,51 @@ export class UserCredsService {
     return {
       replyText: `Linked GitHub as ${probe.login}.`,
       persisted: true,
+    };
+  }
+
+  /**
+   * Public-safe connection status for a user: which integrations are linked
+   * and the cosmetic identifiers (account email / GitHub login) needed to
+   * render the Settings → Connections page. Never includes raw cred
+   * material — the SPA must never see access tokens.
+   *
+   * Implementation note: this reads the secret store rather than the cache
+   * because the cache only retains tokens (for the env overlay) and not
+   * cosmetic fields like `accountEmail` or GitHub `login`. Cost is a single
+   * `getSecret(uid)` per page load — the SM call is fast enough at this
+   * scale. If it ever isn't, materialize() can also seed the email/login
+   * into the cache.
+   */
+  async getConnectionStatus(slackUserId: string): Promise<ConnectionStatus> {
+    const json = await this.store.getSecret(slackUserId);
+    if (!json) {
+      return { anthropic: { linked: false }, github: { linked: false } };
+    }
+    let creds: UserCreds;
+    try {
+      creds = JSON.parse(json) as UserCreds;
+    } catch (err) {
+      // Stored doc is corrupt — surface as "not linked" rather than 500ing.
+      // The user can re-link via /archon-creds and we'll overwrite the
+      // bad doc on the next upsert.
+      getLog().error(
+        { err, slackUserId: maskUid(slackUserId) },
+        'user-creds.connection_status_parse_failed'
+      );
+      return { anthropic: { linked: false }, github: { linked: false } };
+    }
+    return {
+      anthropic: creds.anthropic
+        ? { linked: true, accountEmail: creds.anthropic.accountEmail }
+        : { linked: false },
+      github: creds.github
+        ? {
+            linked: true,
+            login: creds.github.login,
+            installationId: creds.github.installationId,
+          }
+        : { linked: false },
     };
   }
 
@@ -363,9 +403,7 @@ export class UserCredsService {
 
 // ─── Validation helpers ─────────────────────────────────────────────────────
 
-type ParseResult =
-  | { ok: true; creds: AnthropicCreds }
-  | { ok: false; error: string };
+type ParseResult = { ok: true; creds: AnthropicCreds } | { ok: false; error: string };
 
 /**
  * Validate the JSON pasted by a user via `/archon-creds anthropic <json>`.
@@ -388,7 +426,7 @@ function parseAnthropicJson(raw: string): ParseResult {
     return { ok: false, error: 'Expected a JSON object — got something else.' };
   }
   const obj = parsed as Record<string, unknown>;
-  const oauthRaw = obj['claudeAiOauth'];
+  const oauthRaw = obj.claudeAiOauth;
   if (!oauthRaw || typeof oauthRaw !== 'object') {
     return {
       ok: false,
@@ -398,7 +436,7 @@ function parseAnthropicJson(raw: string): ParseResult {
     };
   }
   const oauth = oauthRaw as Record<string, unknown>;
-  const accessToken = oauth['accessToken'];
+  const accessToken = oauth.accessToken;
   if (typeof accessToken !== 'string' || accessToken.length === 0) {
     return { ok: false, error: 'Missing or empty `claudeAiOauth.accessToken`.' };
   }
@@ -426,10 +464,7 @@ function pickNumberField(o: Record<string, unknown>, key: string): number | unde
   return typeof v === 'number' ? v : undefined;
 }
 
-function pickStringArrayField(
-  o: Record<string, unknown>,
-  key: string
-): string[] | undefined {
+function pickStringArrayField(o: Record<string, unknown>, key: string): string[] | undefined {
   const v = o[key];
   if (!Array.isArray(v)) return undefined;
   return v.filter((x): x is string => typeof x === 'string');
@@ -447,7 +482,14 @@ function maskUid(uid: string): string {
 export { maskUid };
 export type { ISecretStore } from './secret-store';
 export { InMemorySecretStore } from './secret-store';
-export type { UserCreds, UserEnvOverlay, AnthropicCreds, GithubCreds, UpsertResult } from './types';
+export type {
+  UserCreds,
+  UserEnvOverlay,
+  AnthropicCreds,
+  GithubCreds,
+  UpsertResult,
+  ConnectionStatus,
+} from './types';
 
 // ─── Singleton accessor ─────────────────────────────────────────────────────
 //

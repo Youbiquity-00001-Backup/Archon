@@ -17,12 +17,16 @@ import {
   getCodebaseEnvVars,
   setCodebaseEnvVar,
   deleteCodebaseEnvVar,
+  getIdentity,
+  getConnections,
 } from '@/lib/api';
 import type {
   SafeConfigResponse,
   CodebaseResponse,
   ProviderDefaults,
   ProviderInfo,
+  IdentityResponse,
+  ConnectionsResponse,
 } from '@/lib/api';
 
 const selectClass =
@@ -257,6 +261,95 @@ function EnvVarsPanel({ codebaseId }: { codebaseId: string }): React.ReactElemen
   );
 }
 
+/**
+ * Per-user account connections (Patch 4 / Phase A.1) — Anthropic OAuth and
+ * GitHub user-to-server OAuth status. Distinct from `PlatformConnectionsSection`
+ * which shows deployment-level Slack/Telegram/etc configuration; this one is
+ * scoped to the signed-in user's own account links.
+ *
+ * Triggers for both kinds of (re)linking are intentionally NOT in the SPA:
+ *  - Anthropic uses `/archon-creds anthropic <json>` in Slack DM (paste-in-
+ *    web is awkward UX, slash-command flow is already proven).
+ *  - GitHub uses `/auth/github/initiate` which 302-redirects to GitHub.
+ *    The "Link GitHub" button below navigates straight to that endpoint.
+ */
+function AccountConnectionsSection(): React.ReactElement {
+  const { data, isLoading, error } = useQuery<ConnectionsResponse | null>({
+    queryKey: ['auth', 'connections'],
+    queryFn: getConnections,
+    staleTime: 30 * 1000,
+  });
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>My Connections</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-4 text-sm">
+        {isLoading && <div className="text-muted-foreground">Loading…</div>}
+        {error && (
+          <div className="text-destructive">
+            {error instanceof Error ? error.message : 'Failed to load connections'}
+          </div>
+        )}
+        {!isLoading && !error && !data && (
+          <div className="text-muted-foreground">
+            Sign-in required. In dev mode (no ALB OIDC), this section stays empty.
+          </div>
+        )}
+
+        {data && (
+          <>
+            <div>
+              <div className="font-medium">Anthropic</div>
+              {data.anthropic.linked ? (
+                <div className="text-xs text-muted-foreground">
+                  Linked
+                  {data.anthropic.accountEmail ? ` as ${data.anthropic.accountEmail}` : ''}
+                </div>
+              ) : (
+                <div className="text-xs text-muted-foreground">
+                  Not linked. Run <code>/archon-creds anthropic …</code> in Slack DM.
+                </div>
+              )}
+            </div>
+
+            <div>
+              <div className="font-medium">GitHub</div>
+              {data.github.linked ? (
+                <div className="space-y-1">
+                  <div className="text-xs text-muted-foreground">
+                    Linked as <span className="font-mono">{data.github.login}</span>
+                    {data.github.installationId
+                      ? ` (installation #${String(data.github.installationId)})`
+                      : ''}
+                  </div>
+                  <Button
+                    asChild
+                    variant="outline"
+                    size="sm"
+                    className="text-xs"
+                    title="Re-run the OAuth flow to refresh this link"
+                  >
+                    <a href="/auth/github/initiate">Re-link GitHub</a>
+                  </Button>
+                </div>
+              ) : (
+                <div className="space-y-1">
+                  <div className="text-xs text-muted-foreground">Not linked.</div>
+                  <Button asChild variant="default" size="sm" className="text-xs">
+                    <a href="/auth/github/initiate">Link GitHub</a>
+                  </Button>
+                </div>
+              )}
+            </div>
+          </>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 function ProjectsSection(): React.ReactElement {
   const queryClient = useQueryClient();
   const [addValue, setAddValue] = useState('');
@@ -267,6 +360,17 @@ function ProjectsSection(): React.ReactElement {
     queryKey: ['codebases'],
     queryFn: listCodebases,
   });
+
+  // Identity drives the registrar-only Remove guard. In dev (no OIDC
+  // middleware) the query returns null and we treat every row as
+  // removable — the backend is the actual authority and would also
+  // skip the check, so the UI matches.
+  const { data: identity } = useQuery<IdentityResponse | null>({
+    queryKey: ['auth', 'identity'],
+    queryFn: getIdentity,
+    staleTime: 5 * 60 * 1000,
+  });
+  const currentUid = identity?.slackUserId ?? null;
 
   const addMutation = useMutation({
     mutationFn: (value: string) => addCodebase(getCodebaseInput(value)),
@@ -301,39 +405,59 @@ function ProjectsSection(): React.ReactElement {
           <div className="text-sm text-muted-foreground">No projects registered.</div>
         ) : (
           <div className="space-y-2">
-            {codebases.map((cb: CodebaseResponse) => (
-              <div key={cb.id} className="rounded-md border border-border p-2 text-sm">
-                <div className="flex items-center justify-between">
-                  <div className="min-w-0 flex-1">
-                    <div className="font-medium truncate">{cb.name}</div>
-                    <div className="text-xs text-muted-foreground truncate">{cb.default_cwd}</div>
+            {codebases.map((cb: CodebaseResponse) => {
+              // Remove allowed when:
+              //  - we don't know the current user (dev mode \u2192 backend has
+              //    no enforcement either, so the button is consistent), OR
+              //  - the codebase has no registrar attribution (legacy row
+              //    or registered before Patch 3), OR
+              //  - the current user IS the registrar.
+              const canRemove =
+                currentUid === null ||
+                cb.registered_by_slack_user_id === null ||
+                cb.registered_by_slack_user_id === currentUid;
+              return (
+                <div key={cb.id} className="rounded-md border border-border p-2 text-sm">
+                  <div className="flex items-center justify-between">
+                    <div className="min-w-0 flex-1">
+                      <div className="font-medium truncate">{cb.name}</div>
+                      <div className="text-xs text-muted-foreground truncate">{cb.default_cwd}</div>
+                      {cb.registered_by_slack_user_id && (
+                        <div className="text-xs text-muted-foreground truncate">
+                          Registered by{' '}
+                          <span className="font-mono">{cb.registered_by_slack_user_id}</span>
+                        </div>
+                      )}
+                    </div>
+                    <div className="flex gap-1">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="text-xs"
+                        onClick={() => {
+                          setExpandedEnvVars(expandedEnvVars === cb.id ? null : cb.id);
+                        }}
+                      >
+                        Env Vars {expandedEnvVars === cb.id ? '\u25B2' : '\u25BC'}
+                      </Button>
+                      {canRemove && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => {
+                            deleteMutation.mutate(cb.id);
+                          }}
+                          disabled={deleteMutation.isPending}
+                        >
+                          Remove
+                        </Button>
+                      )}
+                    </div>
                   </div>
-                  <div className="flex gap-1">
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="text-xs"
-                      onClick={() => {
-                        setExpandedEnvVars(expandedEnvVars === cb.id ? null : cb.id);
-                      }}
-                    >
-                      Env Vars {expandedEnvVars === cb.id ? '\u25B2' : '\u25BC'}
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => {
-                        deleteMutation.mutate(cb.id);
-                      }}
-                      disabled={deleteMutation.isPending}
-                    >
-                      Remove
-                    </Button>
-                  </div>
+                  {expandedEnvVars === cb.id && <EnvVarsPanel codebaseId={cb.id} />}
                 </div>
-                {expandedEnvVars === cb.id && <EnvVarsPanel codebaseId={cb.id} />}
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
 
@@ -722,6 +846,8 @@ export function SettingsPage(): React.ReactElement {
             {configData && <AssistantConfigSection config={configData.config} />}
             <PlatformConnectionsSection activePlatforms={health?.activePlatforms} />
           </div>
+
+          <AccountConnectionsSection />
 
           <ProjectsSection />
         </div>
