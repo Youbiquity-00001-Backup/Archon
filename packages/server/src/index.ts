@@ -492,23 +492,20 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       // ephemeral by default — these flows handle credentials, the user
       // never wants the channel to see them.
 
-      slackAdapter.onSlashCommand('/archon-creds', async (slackUserId, text, isDM, triggerId) => {
+      slackAdapter.onSlashCommand('/archon-creds', async (slackUserId, text, _isDM, triggerId) => {
         const [subRaw] = text.trim().split(/\s+/);
         const sub = (subRaw ?? '').toLowerCase();
 
         if (sub === 'anthropic') {
-          if (!isDM) {
-            return {
-              replyText:
-                'Run this in a DM with me — channels are public, your `.credentials.json` is not.',
-            };
-          }
           // Open the paste-credentials modal. Mirrors the cred-paste UX
           // in llm-slack-channel-bridge: keeps the JSON out of slash-
           // command text (which Slack logs and renders inline) and gives
-          // us inline validation via response_action: errors. Empty
-          // replyText so the slash command returns silently and the
-          // modal is the user-visible action.
+          // us inline validation via response_action: errors. Modal
+          // payloads are user-private — Slack doesn't broadcast them to
+          // the channel — so this works equally well from a DM or a
+          // channel and we no longer guard on isDM. Empty replyText so
+          // the slash command returns silently and the modal is the
+          // user-visible action.
           const r = await slackAdapter.openView(triggerId, anthropicCredsModal());
           if (!r.ok) {
             return {
