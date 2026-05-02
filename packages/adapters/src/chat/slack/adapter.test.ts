@@ -440,7 +440,10 @@ describe('SlackAdapter', () => {
 
     test('rejects unauthorized users when allowlist is configured', async () => {
       const original = process.env.SLACK_ALLOWED_USER_IDS;
-      process.env.SLACK_ALLOWED_USER_IDS = 'U_AUTHED';
+      // IDs must match Slack's real format ([UW][A-Z0-9]+) — parseAllowedUserIds
+      // filters anything else (e.g. underscores), which would silently empty the
+      // allowlist and put the adapter in open-access mode.
+      process.env.SLACK_ALLOWED_USER_IDS = 'UAUTHED1';
       try {
         const adapter2 = new SlackAdapter('xoxb-fake', 'xapp-fake');
         const handler = mock(async () => ({ replyText: 'should not fire' }));
@@ -449,7 +452,7 @@ describe('SlackAdapter', () => {
         const wired = slashRegistrations.get('/archon-creds');
         const respond = mock(async () => undefined);
         await wired?.({
-          command: { user_id: 'U_OTHER', channel_name: 'directmessage', text: '' },
+          command: { user_id: 'UOTHER12', channel_name: 'directmessage', text: '' },
           ack,
           respond,
         });
