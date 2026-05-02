@@ -1,0 +1,39 @@
+# CI backstop for the local pre-push hook (.husky/pre-push +
+# scripts/auto-bump-infra.sh). Catches the cases the local hook can't:
+#
+#   - `git push --no-verify` (skips husky)
+#   - merges via the GitHub web UI / API (no local git client involved)
+#   - pushes from a contributor whose local clone never ran `bun install`
+#     and therefore never had husky bootstrapped
+#
+# Idempotent with the local hook — if the hook already opened a PR for
+# this SHA, the script no-ops on the existing branch and reports the
+# same PR URL. So running both layers on the same push is harmless.
+#
+# Requires repo secret `INFRA_BUMP_TOKEN`: a fine-scoped PAT or GH App
+# installation token with `contents:write` + `pull-requests:write` on
+# `Youbiquity-00001-Backup/youbiquity-archon-infra`. The default
+# GITHUB_TOKEN cannot push across repositories. If the secret is unset,
+# the script's token-resolution chain exits 0 with a stderr warning and
+# this job still passes (a backstop that can't run shouldn't fail CI).
+
+name: auto-bump-infra
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  bump:
+    name: bump archon_sha in infra repo
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: bump
+        env:
+          # Optional repo secret. Script no-ops gracefully if unset.
+          INFRA_BUMP_TOKEN: ${{ secrets.INFRA_BUMP_TOKEN }}
+        run: ./scripts/auto-bump-infra.sh "$GITHUB_SHA"

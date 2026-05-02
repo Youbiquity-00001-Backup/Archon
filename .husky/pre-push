@@ -1,0 +1,27 @@
+# Pre-push hook: when pushing to `main`, propose a matching infra
+# `archon_sha` bump in youbiquity-archon-infra so the deploy actually
+# ships. Pushing to Archon main is NOT a deploy on its own — the infra
+# repo's pinned SHA is what the build/CodeDeploy pipeline reads.
+#
+# Implementation lives in `scripts/auto-bump-infra.sh`; this hook just
+# extracts the SHA being pushed from git's pre-push stdin protocol and
+# invokes the script. Bump errors are swallowed (`|| true`) — never
+# block the push for what is fundamentally an opportunistic side effect.
+#
+# Skipped automatically when not pushing to main (most pushes), or when
+# pushing a branch deletion (local SHA = all zeros).
+
+ZERO=0000000000000000000000000000000000000000
+PUSHED_SHA=""
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  if [ "$remote_ref" = "refs/heads/main" ] && [ "$local_sha" != "$ZERO" ]; then
+    PUSHED_SHA="$local_sha"
+    break
+  fi
+done
+
+if [ -n "$PUSHED_SHA" ]; then
+  ROOT="$(git rev-parse --show-toplevel)"
+  "$ROOT/scripts/auto-bump-infra.sh" "$PUSHED_SHA" || true
+fi
