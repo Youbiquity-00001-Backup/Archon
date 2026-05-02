@@ -221,8 +221,8 @@ function renderHtmlOk(c: Context, msg: string): Response {
   // No external assets, no JS — keeps the page renderable even when ALB OIDC
   // is in the middle of redirecting.
   return c.html(
-    `<!doctype html><html><head><meta charset="utf-8"><title>Linked</title></head>` +
-      `<body style="font-family:system-ui,sans-serif;max-width:32rem;margin:4rem auto;line-height:1.5">` +
+    '<!doctype html><html><head><meta charset="utf-8"><title>Linked</title></head>' +
+      '<body style="font-family:system-ui,sans-serif;max-width:32rem;margin:4rem auto;line-height:1.5">' +
       `<h2>${escapeHtml(msg)}</h2><p>You can close this tab.</p></body></html>`,
     200
   );
@@ -230,8 +230,8 @@ function renderHtmlOk(c: Context, msg: string): Response {
 
 function renderHtmlError(c: Context, msg: string): Response {
   return c.html(
-    `<!doctype html><html><head><meta charset="utf-8"><title>Sign-in failed</title></head>` +
-      `<body style="font-family:system-ui,sans-serif;max-width:32rem;margin:4rem auto;line-height:1.5">` +
+    '<!doctype html><html><head><meta charset="utf-8"><title>Sign-in failed</title></head>' +
+      '<body style="font-family:system-ui,sans-serif;max-width:32rem;margin:4rem auto;line-height:1.5">' +
       `<h2>Sign-in failed</h2><p>${escapeHtml(msg)}</p></body></html>`,
     400
   );
