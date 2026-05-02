@@ -1094,7 +1094,8 @@ export function registerApiRoutes(
    */
   async function tryAutoResumeAfterGate(
     run: WorkflowRun,
-    action: 'approve' | 'reject'
+    action: 'approve' | 'reject',
+    platformUserId?: string
   ): Promise<boolean> {
     if (!run.parent_conversation_id) return false;
     // Literal event names per action — greppable for ops tooling. Keeping the
@@ -1149,7 +1150,11 @@ export function registerApiRoutes(
         return false;
       }
       const resumeMessage = `/workflow run ${run.workflow_name} ${run.user_message ?? ''}`.trim();
-      await dispatchToOrchestrator(platformConvId, resumeMessage);
+      await dispatchToOrchestrator(
+        platformConvId,
+        resumeMessage,
+        platformUserId ? { platformUserId } : undefined
+      );
       getLog().info(
         { runId: run.id, workflowName: run.workflow_name, platformConvId },
         events.dispatched
@@ -1250,7 +1255,12 @@ export function registerApiRoutes(
           );
         }
 
-        const result = await dispatchToOrchestrator(conversation.platform_conversation_id, message);
+        const platformUserId = getIdentity(c)?.slackUserId;
+        const result = await dispatchToOrchestrator(
+          conversation.platform_conversation_id,
+          message,
+          platformUserId ? { platformUserId } : undefined
+        );
 
         return c.json({
           conversationId: conversation.platform_conversation_id,
@@ -1492,10 +1502,16 @@ export function registerApiRoutes(
     // Pass savedFiles to dispatchToOrchestrator so cleanup happens inside the lock handler,
     // AFTER handleMessage completes — not in the HTTP handler's finally block where the
     // fire-and-forget lock callback may still be running and the AI has not yet read the files.
+    const platformUserId = getIdentity(c)?.slackUserId;
     let extraContext: Omit<HandleMessageContext, 'isolationHints'> | undefined;
     let filesToCleanup: { files: AttachedFile[]; uploadDir: string } | undefined;
+    if (savedFiles.length > 0 || platformUserId) {
+      extraContext = {
+        ...(savedFiles.length > 0 ? { attachedFiles: savedFiles } : {}),
+        ...(platformUserId ? { platformUserId } : {}),
+      };
+    }
     if (savedFiles.length > 0) {
-      extraContext = { attachedFiles: savedFiles };
       filesToCleanup = { files: savedFiles, uploadDir };
     }
     const result = await dispatchToOrchestrator(
@@ -1934,7 +1950,12 @@ export function registerApiRoutes(
       }
 
       const fullMessage = `/workflow run ${workflowName} ${message}`;
-      const result = await dispatchToOrchestrator(conversationId, fullMessage);
+      const platformUserId = getIdentity(c)?.slackUserId;
+      const result = await dispatchToOrchestrator(
+        conversationId,
+        fullMessage,
+        platformUserId ? { platformUserId } : undefined
+      );
       return c.json(result);
     } catch (error) {
       getLog().error({ err: error }, 'run_workflow_failed');
@@ -2098,7 +2119,11 @@ export function registerApiRoutes(
       // `parent_conversation_id` on the run (set by orchestrator-agent for any
       // web-dispatched workflow — foreground, interactive, and background via
       // the pre-created run) and a web-platform parent (guarded in the helper).
-      const autoResumed = await tryAutoResumeAfterGate(run, 'approve');
+      const autoResumed = await tryAutoResumeAfterGate(
+        run,
+        'approve',
+        getIdentity(c)?.slackUserId
+      );
 
       return c.json({
         success: true,
@@ -2153,7 +2178,11 @@ export function registerApiRoutes(
         // without requiring the user to re-run the workflow command. Mirrors
         // what `workflowRejectCommand` does in the CLI. Same cross-adapter
         // guard as approve — only web parents auto-resume.
-        const autoResumed = await tryAutoResumeAfterGate(run, 'reject');
+        const autoResumed = await tryAutoResumeAfterGate(
+          run,
+          'reject',
+          getIdentity(c)?.slackUserId
+        );
 
         return c.json({
           success: true,
