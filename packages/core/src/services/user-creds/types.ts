@@ -47,11 +47,18 @@ export interface UserCreds {
  * Subset of process-env vars the orchestrator overlays for a known platform user.
  * `HOME` points at the user's per-user dir so subprocesses pick up
  * `.claude/.credentials.json` and `.git-credentials` from that location.
+ *
+ * Note: the Anthropic credential is the OAuth bearer token from
+ * `claude /login` (`claudeAiOauth.accessToken`), NOT a console
+ * `sk-ant-...` API key. It must be injected as `CLAUDE_CODE_OAUTH_TOKEN`
+ * — the SDK env var that consumes OAuth tokens. Setting it as
+ * `ANTHROPIC_API_KEY` makes the SDK send it as a Bearer API key, which
+ * Anthropic 401s with "Invalid authentication credentials".
  */
 export interface UserEnvOverlay {
   HOME?: string;
   GH_TOKEN?: string;
-  ANTHROPIC_API_KEY?: string;
+  CLAUDE_CODE_OAUTH_TOKEN?: string;
 }
 
 /** Result of an `upsertForUser` call. */

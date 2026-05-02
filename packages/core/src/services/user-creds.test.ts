@@ -62,7 +62,7 @@ describe('UserCredsService', () => {
       expect(overlay).not.toBeNull();
       expect(overlay?.HOME).toBe(join(usersDir, 'U1'));
       expect(overlay?.GH_TOKEN).toBe('gho_test');
-      expect(overlay?.ANTHROPIC_API_KEY).toBe('sk-test-anthropic');
+      expect(overlay?.CLAUDE_CODE_OAUTH_TOKEN).toBe('sk-test-anthropic');
 
       // Disk materialization too — that's what the orchestrator's HOME-overlay
       // depends on for git/Claude SDK to find the right credential files.
@@ -124,7 +124,7 @@ describe('UserCredsService', () => {
       expect(result.persisted).toBe(true);
       const overlay = svc.getEnvOverlay('U1');
       expect(overlay?.GH_TOKEN).toBeUndefined();
-      expect(overlay?.ANTHROPIC_API_KEY).toBe('sk-only');
+      expect(overlay?.CLAUDE_CODE_OAUTH_TOKEN).toBe('sk-only');
       expect(overlay?.HOME).toContain('U1');
     });
   });
@@ -192,7 +192,7 @@ describe('UserCredsService', () => {
       // Cache reflects both.
       const overlay = svc.getEnvOverlay('U1');
       expect(overlay?.GH_TOKEN).toBe('gho_first');
-      expect(overlay?.ANTHROPIC_API_KEY).toBe('sk-second');
+      expect(overlay?.CLAUDE_CODE_OAUTH_TOKEN).toBe('sk-second');
     });
   });
 
@@ -294,7 +294,7 @@ describe('UserCredsService', () => {
       expect(result.rotated).toBe(true);
 
       // Cache reflects the new access token (so the next env overlay has it).
-      expect(svc.getEnvOverlay('U1')?.ANTHROPIC_API_KEY).toBe('sk-NEW');
+      expect(svc.getEnvOverlay('U1')?.CLAUDE_CODE_OAUTH_TOKEN).toBe('sk-NEW');
 
       // Store reflects the new tokens AND preserves the cosmetic accountEmail.
       const stored = JSON.parse((await store.getSecret('U1')) ?? '{}') as UserCreds;
@@ -336,7 +336,7 @@ describe('UserCredsService', () => {
       const result = await svc.syncFromDisk('U1');
       expect(result.rotated).toBe(false);
       // Cache still has the old token — bad disk read should not overwrite.
-      expect(svc.getEnvOverlay('U1')?.ANTHROPIC_API_KEY).toBe('sk-old');
+      expect(svc.getEnvOverlay('U1')?.CLAUDE_CODE_OAUTH_TOKEN).toBe('sk-old');
     });
 
     test('captures GitHub access token written externally', async () => {

@@ -51,7 +51,11 @@ interface CacheEntry {
   home: string;
   ghToken?: string;
   ghTokenExpiresAt?: number;
-  /** Anthropic cred we materialized — kept so `getEnvOverlay` knows whether to set ANTHROPIC_API_KEY. */
+  /** Anthropic OAuth access token (`claudeAiOauth.accessToken`) we
+   * materialized. Kept so `getEnvOverlay` knows whether to inject
+   * `CLAUDE_CODE_OAUTH_TOKEN` for the spawned SDK. NOT an `sk-ant-…`
+   * API key — must be injected as the OAuth env var, not as
+   * `ANTHROPIC_API_KEY` (Anthropic 401s OAuth tokens sent as API keys). */
   anthropicAccessToken?: string;
 }
 
@@ -278,7 +282,12 @@ export class UserCredsService {
     if (!entry) return null;
     const overlay: UserEnvOverlay = { HOME: entry.home };
     if (entry.ghToken) overlay.GH_TOKEN = entry.ghToken;
-    if (entry.anthropicAccessToken) overlay.ANTHROPIC_API_KEY = entry.anthropicAccessToken;
+    // Inject as CLAUDE_CODE_OAUTH_TOKEN, not ANTHROPIC_API_KEY:
+    // `claudeAiOauth.accessToken` is an OAuth bearer (sk-ant-oat01-…),
+    // not a console API key (sk-ant-api03-…). The SDK rejects OAuth
+    // tokens sent through ANTHROPIC_API_KEY with 401 "Invalid
+    // authentication credentials".
+    if (entry.anthropicAccessToken) overlay.CLAUDE_CODE_OAUTH_TOKEN = entry.anthropicAccessToken;
     return overlay;
   }
 
