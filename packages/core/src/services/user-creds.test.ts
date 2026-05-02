@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeEach, mock } from 'bun:test';
-import { mkdtemp, readFile } from 'fs/promises';
+import { access, mkdtemp, readFile, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { createMockLogger } from '../test/mocks/logger';
@@ -16,6 +16,8 @@ import {
   InMemorySecretStore,
   type AnthropicProbe,
   type GithubProbe,
+  type GithubRefresh,
+  type UserCreds,
 } from './user-creds';
 
 describe('UserCredsService', () => {
@@ -74,7 +76,10 @@ describe('UserCredsService', () => {
     });
 
     test('is idempotent (second call is a no-op)', async () => {
-      store.seed('U1', JSON.stringify({ github: { type: 'oauth', accessToken: 'g1', login: 'l' } }));
+      store.seed(
+        'U1',
+        JSON.stringify({ github: { type: 'oauth', accessToken: 'g1', login: 'l' } })
+      );
       const svc = newService();
       await svc.bootstrap();
       await svc.bootstrap();
@@ -92,6 +97,16 @@ describe('UserCredsService', () => {
 
       expect(svc.getEnvOverlay('U1')).toBeNull();
       expect(svc.getEnvOverlay('U2')?.GH_TOKEN).toBe('gh-ok');
+    });
+
+    test('skips tombstone entries (empty docs left by refresh-chain-dead)', async () => {
+      store.seed('U_DEAD', JSON.stringify({}));
+      const svc = newService();
+      await svc.bootstrap();
+      // Tombstone must NOT materialize a HOME-only cache entry — otherwise
+      // the orchestrator would build an env overlay pointing at an empty
+      // per-user dir and break the global-auth fallback.
+      expect(svc.getEnvOverlay('U_DEAD')).toBeNull();
     });
   });
 
@@ -259,6 +274,266 @@ describe('UserCredsService', () => {
       const status = await svc.getConnectionStatus('U_CORRUPT');
       expect(status.anthropic.linked).toBe(false);
       expect(status.github.linked).toBe(false);
+    });
+  });
+
+  describe('syncFromDisk', () => {
+    test('captures Anthropic rotation written by the subprocess', async () => {
+      const svc = newService();
+      await svc.upsertAnthropic('U1', JSON.stringify({ claudeAiOauth: { accessToken: 'sk-old' } }));
+
+      // Simulate the Claude Code subprocess refreshing creds in place.
+      await writeFile(
+        join(usersDir, 'U1', '.claude', '.credentials.json'),
+        JSON.stringify({
+          claudeAiOauth: { accessToken: 'sk-NEW', refreshToken: 'rt-new', expiresAt: 9_999 },
+        })
+      );
+
+      const result = await svc.syncFromDisk('U1');
+      expect(result.rotated).toBe(true);
+
+      // Cache reflects the new access token (so the next env overlay has it).
+      expect(svc.getEnvOverlay('U1')?.ANTHROPIC_API_KEY).toBe('sk-NEW');
+
+      // Store reflects the new tokens AND preserves the cosmetic accountEmail.
+      const stored = JSON.parse((await store.getSecret('U1')) ?? '{}') as UserCreds;
+      expect(stored.anthropic?.claudeAiOauth.accessToken).toBe('sk-NEW');
+      expect(stored.anthropic?.claudeAiOauth.refreshToken).toBe('rt-new');
+      expect(stored.anthropic?.accountEmail).toBe('alice@example.com');
+    });
+
+    test('rotation: false when the disk file matches the cache', async () => {
+      const svc = newService();
+      await svc.upsertAnthropic(
+        'U1',
+        JSON.stringify({ claudeAiOauth: { accessToken: 'sk-stable' } })
+      );
+      const result = await svc.syncFromDisk('U1');
+      expect(result.rotated).toBe(false);
+    });
+
+    test('rotation: false when the user has no cache entry', async () => {
+      const svc = newService();
+      // No materialize call → no cache entry.
+      const result = await svc.syncFromDisk('U_NEVER_LINKED');
+      expect(result.rotated).toBe(false);
+    });
+
+    test('rotation: false when the credentials file is missing (pre-link state)', async () => {
+      const svc = newService();
+      // Materialize only GitHub so the user has a cache entry but no
+      // .credentials.json on disk.
+      await svc.upsertGithub('U1', { type: 'oauth', accessToken: 'gho-1' });
+      const result = await svc.syncFromDisk('U1');
+      expect(result.rotated).toBe(false);
+    });
+
+    test('malformed JSON on disk is logged and treated as no rotation', async () => {
+      const svc = newService();
+      await svc.upsertAnthropic('U1', JSON.stringify({ claudeAiOauth: { accessToken: 'sk-old' } }));
+      await writeFile(join(usersDir, 'U1', '.claude', '.credentials.json'), '{ not json');
+      const result = await svc.syncFromDisk('U1');
+      expect(result.rotated).toBe(false);
+      // Cache still has the old token — bad disk read should not overwrite.
+      expect(svc.getEnvOverlay('U1')?.ANTHROPIC_API_KEY).toBe('sk-old');
+    });
+
+    test('captures GitHub access token written externally', async () => {
+      const svc = newService();
+      await svc.upsertGithub('U1', {
+        type: 'oauth',
+        accessToken: 'gho-old',
+        refreshToken: 'ghr-keep',
+      });
+      await writeFile(
+        join(usersDir, 'U1', '.git-credentials'),
+        'https://x-access-token:gho-NEW@github.com\n'
+      );
+      const result = await svc.syncFromDisk('U1');
+      expect(result.rotated).toBe(true);
+      expect(svc.getEnvOverlay('U1')?.GH_TOKEN).toBe('gho-NEW');
+      // Refresh token / login preserved from the stored doc.
+      const stored = JSON.parse((await store.getSecret('U1')) ?? '{}') as UserCreds;
+      expect(stored.github?.accessToken).toBe('gho-NEW');
+      expect(stored.github?.refreshToken).toBe('ghr-keep');
+      expect(stored.github?.login).toBe('alice');
+    });
+
+    test('store write failure is logged and reported as no rotation', async () => {
+      const svc = newService();
+      await svc.upsertAnthropic('U1', JSON.stringify({ claudeAiOauth: { accessToken: 'sk-old' } }));
+      await writeFile(
+        join(usersDir, 'U1', '.claude', '.credentials.json'),
+        JSON.stringify({ claudeAiOauth: { accessToken: 'sk-NEW' } })
+      );
+      // Replace putSecret with a function that throws — the upsert is done
+      // already so the only future write is the one from syncFromDisk.
+      store.putSecret = async () => {
+        throw new Error('SM unavailable');
+      };
+      const result = await svc.syncFromDisk('U1');
+      expect(result.rotated).toBe(false);
+    });
+  });
+
+  describe('ensureFreshGithub', () => {
+    function fakeRefresh(impl: GithubRefresh): GithubRefresh {
+      return impl;
+    }
+
+    test('no-op when the user is not linked', async () => {
+      const calls: string[] = [];
+      const svc = new UserCredsService({
+        store,
+        usersDir,
+        anthropicProbe: probes.anthropic,
+        githubProbe: probes.github,
+        githubRefresh: fakeRefresh(async rt => {
+          calls.push(rt);
+          return { ok: true, accessToken: 'x' };
+        }),
+      });
+      await svc.ensureFreshGithub('U_NONE');
+      expect(calls).toEqual([]);
+    });
+
+    test('no-op when the token still has more than 10 minutes of life', async () => {
+      const now = 1_700_000_000_000;
+      const calls: string[] = [];
+      const svc = new UserCredsService({
+        store,
+        usersDir,
+        anthropicProbe: probes.anthropic,
+        githubProbe: probes.github,
+        clock: () => now,
+        githubRefresh: fakeRefresh(async rt => {
+          calls.push(rt);
+          return { ok: true };
+        }),
+      });
+      // Token expires in 1 hour — well past the 10-min lead.
+      await svc.upsertGithub('U1', {
+        type: 'oauth',
+        accessToken: 'gho-fresh',
+        refreshToken: 'ghr-1',
+        expiresAt: Math.floor(now / 1000) + 3600,
+      });
+      await svc.ensureFreshGithub('U1');
+      expect(calls).toEqual([]);
+    });
+
+    test('refreshes and persists when the token is at the threshold', async () => {
+      let now = 1_700_000_000_000;
+      const refreshCalls: string[] = [];
+      const svc = new UserCredsService({
+        store,
+        usersDir,
+        anthropicProbe: probes.anthropic,
+        githubProbe: probes.github,
+        clock: () => now,
+        githubRefresh: fakeRefresh(async rt => {
+          refreshCalls.push(rt);
+          return {
+            ok: true,
+            status: 200,
+            accessToken: 'gho-NEW',
+            refreshToken: 'ghr-NEW',
+            expiresAt: Math.floor(now / 1000) + 28_800,
+          };
+        }),
+      });
+      await svc.upsertGithub('U1', {
+        type: 'oauth',
+        accessToken: 'gho-old',
+        refreshToken: 'ghr-old',
+        expiresAt: Math.floor(now / 1000) + 60, // 60s left → inside the 10min lead
+      });
+      await svc.ensureFreshGithub('U1');
+      expect(refreshCalls).toEqual(['ghr-old']);
+      const overlay = svc.getEnvOverlay('U1');
+      expect(overlay?.GH_TOKEN).toBe('gho-NEW');
+      const stored = JSON.parse((await store.getSecret('U1')) ?? '{}') as UserCreds;
+      expect(stored.github?.accessToken).toBe('gho-NEW');
+      expect(stored.github?.refreshToken).toBe('ghr-NEW');
+      // .git-credentials rewritten with the new token.
+      const rewritten = await readFile(join(usersDir, 'U1', '.git-credentials'), 'utf8');
+      expect(rewritten).toBe('https://x-access-token:gho-NEW@github.com\n');
+    });
+
+    test('a 401 from GitHub tombstones the user and clears dotfiles', async () => {
+      const now = 1_700_000_000_000;
+      const svc = new UserCredsService({
+        store,
+        usersDir,
+        anthropicProbe: probes.anthropic,
+        githubProbe: probes.github,
+        clock: () => now,
+        githubRefresh: fakeRefresh(async () => ({ ok: false, status: 401 })),
+      });
+      await svc.upsertGithub('U1', {
+        type: 'oauth',
+        accessToken: 'gho-doomed',
+        refreshToken: 'ghr-revoked',
+        expiresAt: Math.floor(now / 1000) + 60,
+      });
+      await svc.ensureFreshGithub('U1');
+
+      // Cache cleared.
+      expect(svc.getEnvOverlay('U1')).toBeNull();
+
+      // Tombstone written so bootstrap won't re-materialize.
+      const stored = JSON.parse((await store.getSecret('U1')) ?? '{}') as UserCreds;
+      expect(stored.github).toBeUndefined();
+      expect(stored.anthropic).toBeUndefined();
+
+      // .git-credentials removed (best-effort).
+      await expect(access(join(usersDir, 'U1', '.git-credentials'))).rejects.toThrow();
+    });
+
+    test('a transient failure leaves the cache untouched for retry', async () => {
+      const now = 1_700_000_000_000;
+      const svc = new UserCredsService({
+        store,
+        usersDir,
+        anthropicProbe: probes.anthropic,
+        githubProbe: probes.github,
+        clock: () => now,
+        githubRefresh: fakeRefresh(async () => ({ ok: false, status: 503 })),
+      });
+      await svc.upsertGithub('U1', {
+        type: 'oauth',
+        accessToken: 'gho-old',
+        refreshToken: 'ghr-old',
+        expiresAt: Math.floor(now / 1000) + 60,
+      });
+      await svc.ensureFreshGithub('U1');
+      // Cache still has the old token — next call retries.
+      expect(svc.getEnvOverlay('U1')?.GH_TOKEN).toBe('gho-old');
+    });
+
+    test('no-op when no refresh token is stored', async () => {
+      const now = 1_700_000_000_000;
+      const calls: string[] = [];
+      const svc = new UserCredsService({
+        store,
+        usersDir,
+        anthropicProbe: probes.anthropic,
+        githubProbe: probes.github,
+        clock: () => now,
+        githubRefresh: fakeRefresh(async rt => {
+          calls.push(rt);
+          return { ok: true };
+        }),
+      });
+      await svc.upsertGithub('U1', {
+        type: 'oauth',
+        accessToken: 'gho-no-refresh',
+        // No refreshToken
+        expiresAt: Math.floor(now / 1000) + 60,
+      });
+      await svc.ensureFreshGithub('U1');
+      expect(calls).toEqual([]);
     });
   });
 

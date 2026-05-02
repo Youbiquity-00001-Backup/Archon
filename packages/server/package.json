@@ -17,6 +17,7 @@
     "@archon/paths": "workspace:*",
     "@archon/providers": "workspace:*",
     "@archon/workflows": "workspace:*",
+    "@aws-sdk/client-secrets-manager": "^3.972.0",
     "@hono/zod-openapi": "^0.19.6",
     "dotenv": "^17.2.3",
     "hono": "^4.11.4",

@@ -2,12 +2,17 @@
 
 You are on the `youbiquity` branch of `Youbiquity-00001-Backup/Archon` —
 a soft-fork of upstream `coleam00/Archon` that tracks upstream `main`
-and carries two private patches:
+and carries three private patches:
 
 1. **`user_env_vars`** — per-user env injection at the orchestrator's
    `requestOptions` build site, threaded via `HandleMessageContext.platformUserId`.
 2. **`POST /admin/drain`** — auth-gated endpoint that flips an
    in-process flag and stops Slack inbound socket for blue/green deploy drains.
+3. **`user_creds_persistence`** — AWS Secrets Manager-backed `ISecretStore`
+   (`@archon/server/services/aws-secrets-store`), Anthropic write-back via
+   `UserCredsService.syncFromDisk`, GitHub OAuth refresh via
+   `ensureFreshGithub`, and tombstone handling for dead refresh chains.
+   See [`archon-youbiquity/USER-CREDS-PERSISTENCE-DESIGN.md`](https://github.com/Youbiquity-00001-Backup/archon-youbiquity/blob/main/USER-CREDS-PERSISTENCE-DESIGN.md).
 
 See [`PATCH-PLAN.md`](./PATCH-PLAN.md) for the full design.
 
@@ -15,6 +20,12 @@ See [`PATCH-PLAN.md`](./PATCH-PLAN.md) for the full design.
 [`archon-youbiquity/CLAUDE.md`](https://github.com/Youbiquity-00001-Backup/archon-youbiquity/blob/main/CLAUDE.md)
 and the canonical AWS deployment design is in
 [`archon-youbiquity/ARCHON-SLACK-AWS-PLAN.md`](https://github.com/Youbiquity-00001-Backup/archon-youbiquity/blob/main/ARCHON-SLACK-AWS-PLAN.md).
+
+**Git workflow on this fork.** Unlike upstream's `dev` → PR → `main` rule
+(see "Git Workflow and Releases" below), this soft-fork ships changes
+directly to `main`. Commit and push to `main`. The upstream rule is kept
+verbatim further down in this file for merge cleanliness — treat it as
+informational here, not as policy.
 
 **When merging from upstream `coleam00/Archon`:** this section is the
 only intentional divergence in this file — keep it on top during conflict

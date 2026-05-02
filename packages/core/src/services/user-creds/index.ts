@@ -16,7 +16,7 @@
  * hot path must not do I/O per message. `upsertForUser()` performs I/O
  * (secret store + disk) and returns a reply suitable for the Slack adapter.
  */
-import { mkdir, writeFile, chmod } from 'fs/promises';
+import { mkdir, writeFile, chmod, readFile, rm } from 'fs/promises';
 import { join } from 'path';
 import { createLogger } from '@archon/paths';
 import { getArchonHome } from '@archon/paths';
@@ -30,6 +30,14 @@ import type {
   UserEnvOverlay,
   UpsertResult,
 } from './types';
+
+/**
+ * Lead time before a GitHub access-token expiry triggers a proactive refresh.
+ * GitHub access tokens live ~8h; refreshing 10 min ahead gives multiple retry
+ * windows on transient failures without sending the user into expired-token
+ * territory mid-request.
+ */
+const GITHUB_REFRESH_LEAD_MS = 10 * 60 * 1000;
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger). */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -66,6 +74,16 @@ export interface UserCredsServiceOptions {
    * fetch against `GET https://api.github.com/user`. Tests inject a stub.
    */
   githubProbe?: GithubProbe;
+  /**
+   * Refresh-token exchange used by `ensureFreshGithub`. Defaults to a real
+   * POST to GitHub's OAuth token endpoint. Tests inject a stub.
+   */
+  githubRefresh?: GithubRefresh;
+  /**
+   * Returns "now" in ms — used by `ensureFreshGithub` to compare against
+   * `expiresAt`. Defaults to `Date.now`. Tests inject a fake clock.
+   */
+  clock?: () => number;
 }
 
 export type AnthropicProbe = (accessToken: string) => Promise<{
@@ -79,6 +97,29 @@ export type GithubProbe = (accessToken: string) => Promise<{
   login?: string;
   status?: number;
 }>;
+
+/**
+ * Result of exchanging a refresh token at GitHub's token endpoint.
+ *
+ * `status === 401` is the unrecoverable case: GitHub has invalidated the
+ * refresh chain (revocation, expired refresh token). Caller tombstones the
+ * user.
+ *
+ * Any other non-OK result (5xx, network blip) is treated as transient — the
+ * cache is left untouched and the next refresh attempt retries.
+ */
+export interface GithubRefreshResult {
+  ok: boolean;
+  status?: number;
+  /** Unix epoch *seconds* when the new access token expires. */
+  expiresAt?: number;
+  /** Unix epoch *seconds* when the new refresh token expires. */
+  refreshExpiresAt?: number;
+  accessToken?: string;
+  refreshToken?: string;
+}
+
+export type GithubRefresh = (refreshToken: string) => Promise<GithubRefreshResult>;
 
 /** Default Anthropic probe — used in production wiring. */
 const defaultAnthropicProbe: AnthropicProbe = async accessToken => {
@@ -113,12 +154,74 @@ const defaultGithubProbe: GithubProbe = async accessToken => {
   }
 };
 
+/**
+ * Default GitHub OAuth refresh-token exchange. Hits the canonical token
+ * endpoint with `grant_type=refresh_token`. Caller (`ensureFreshGithub`)
+ * supplies the refresh token; client id/secret are sourced from env vars
+ * (`GITHUB_OAUTH_CLIENT_ID`, `GITHUB_OAUTH_CLIENT_SECRET`) configured at
+ * server bootstrap. Tests stub this whole function.
+ */
+const defaultGithubRefresh: GithubRefresh = async refreshToken => {
+  const clientId = process.env.GITHUB_OAUTH_CLIENT_ID;
+  const clientSecret = process.env.GITHUB_OAUTH_CLIENT_SECRET;
+  if (!clientId || !clientSecret) {
+    getLog().warn('user-creds.github_refresh_misconfigured');
+    return { ok: false };
+  }
+  try {
+    const res = await fetch('https://github.com/login/oauth/access_token', {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({
+        client_id: clientId,
+        client_secret: clientSecret,
+        grant_type: 'refresh_token',
+        refresh_token: refreshToken,
+      }).toString(),
+    });
+    const status = res.status;
+    if (!res.ok) return { ok: false, status };
+    const body = (await res.json()) as {
+      access_token?: string;
+      refresh_token?: string;
+      expires_in?: number;
+      refresh_token_expires_in?: number;
+      error?: string;
+    };
+    if (body.error || typeof body.access_token !== 'string') {
+      // GitHub returns 200 with `{ error: "bad_refresh_token" }` when the
+      // refresh chain is dead. Map that to the same 401 semantics.
+      return { ok: false, status: 401 };
+    }
+    const nowSec = Math.floor(Date.now() / 1000);
+    return {
+      ok: true,
+      status,
+      accessToken: body.access_token,
+      refreshToken: body.refresh_token,
+      expiresAt: typeof body.expires_in === 'number' ? nowSec + body.expires_in : undefined,
+      refreshExpiresAt:
+        typeof body.refresh_token_expires_in === 'number'
+          ? nowSec + body.refresh_token_expires_in
+          : undefined,
+    };
+  } catch (err) {
+    getLog().warn({ err }, 'user-creds.github_refresh_threw');
+    return { ok: false };
+  }
+};
+
 export class UserCredsService {
   private readonly store: ISecretStore;
   private readonly usersDir: string;
   private readonly cache = new Map<string, CacheEntry>();
   private readonly anthropicProbe: AnthropicProbe;
   private readonly githubProbe: GithubProbe;
+  private readonly githubRefresh: GithubRefresh;
+  private readonly clock: () => number;
   private bootstrapped = false;
 
   constructor(opts: UserCredsServiceOptions = {}) {
@@ -126,6 +229,8 @@ export class UserCredsService {
     this.usersDir = opts.usersDir ?? join(getArchonHome(), 'users');
     this.anthropicProbe = opts.anthropicProbe ?? defaultAnthropicProbe;
     this.githubProbe = opts.githubProbe ?? defaultGithubProbe;
+    this.githubRefresh = opts.githubRefresh ?? defaultGithubRefresh;
+    this.clock = opts.clock ?? Date.now;
   }
 
   /**
@@ -143,6 +248,11 @@ export class UserCredsService {
         const json = await this.store.getSecret(id);
         if (!json) continue;
         const creds = JSON.parse(json) as UserCreds;
+        // Skip tombstones (`{}` written by `markRefreshChainDead`) — leaving
+        // a `HOME`-only cache entry would point the spawn at an empty per-user
+        // dir and break the global-auth fallback. The user re-links via
+        // `/archon-creds <provider>` when they're ready.
+        if (!creds.anthropic && !creds.github) continue;
         await this.materialize(id, creds);
         materializedCount++;
       } catch (err) {
@@ -306,6 +416,240 @@ export class UserCredsService {
   }
 
   /**
+   * Re-read the per-user dotfiles from disk and persist any changes back
+   * to the secret store.
+   *
+   * The Claude Code subprocess refreshes Anthropic OAuth tokens in place by
+   * rewriting `<HOME>/.claude/.credentials.json` (Anthropic rotates both
+   * access *and* refresh tokens on every refresh — the old refresh token
+   * stops working). Without write-back, the persistent store goes stale on
+   * the first redeploy after a rotation. This method closes that loop:
+   * after every spawn, the orchestrator calls `syncFromDisk` to capture
+   * whatever the subprocess wrote.
+   *
+   * Best-effort. Any IO / parse / store error is logged and swallowed —
+   * never block the response on persistence hiccups. The live filesystem
+   * state is still correct after a failure; the next call retries.
+   */
+  async syncFromDisk(slackUserId: string): Promise<{ rotated: boolean }> {
+    const entry = this.cache.get(slackUserId);
+    if (!entry) {
+      // No cache entry → user never linked or hasn't been materialized.
+      // Nothing to read or compare against.
+      return { rotated: false };
+    }
+
+    let diskAnthropic: AnthropicCreds | null = null;
+    let diskGithubToken: string | null = null;
+
+    // Read Anthropic credentials (may be absent if user hasn't linked Claude).
+    try {
+      const text = await readFile(join(entry.home, '.claude', '.credentials.json'), 'utf8');
+      diskAnthropic = parseClaudeCredentialsFile(text);
+    } catch (err) {
+      if (!isFileMissing(err)) {
+        getLog().warn(
+          { err, slackUserId: maskUid(slackUserId) },
+          'user-creds.sync_anthropic_read_failed'
+        );
+      }
+    }
+
+    // Read .git-credentials (may be absent if user hasn't linked GitHub).
+    try {
+      const text = await readFile(join(entry.home, '.git-credentials'), 'utf8');
+      diskGithubToken = parseGitCredentialsFile(text);
+    } catch (err) {
+      if (!isFileMissing(err)) {
+        getLog().warn(
+          { err, slackUserId: maskUid(slackUserId) },
+          'user-creds.sync_github_read_failed'
+        );
+      }
+    }
+
+    const anthropicChanged = Boolean(
+      diskAnthropic && entry.anthropicAccessToken !== diskAnthropic.claudeAiOauth.accessToken
+    );
+    const githubChanged = Boolean(diskGithubToken && entry.ghToken !== diskGithubToken);
+
+    if (!anthropicChanged && !githubChanged) {
+      return { rotated: false };
+    }
+
+    try {
+      const existingJson = await this.store.getSecret(slackUserId);
+      const prev: UserCreds = existingJson ? (JSON.parse(existingJson) as UserCreds) : {};
+      const next: UserCreds = { ...prev };
+
+      if (anthropicChanged && diskAnthropic) {
+        // Preserve cosmetic fields that the on-disk file does not carry
+        // (accountEmail is captured at upsert time via the OAuth roles probe).
+        next.anthropic = {
+          ...diskAnthropic,
+          accountEmail: prev.anthropic?.accountEmail ?? diskAnthropic.accountEmail,
+        };
+        entry.anthropicAccessToken = diskAnthropic.claudeAiOauth.accessToken;
+      }
+
+      if (githubChanged && diskGithubToken && prev.github) {
+        // .git-credentials only carries the access token; preserve refresh
+        // token, expiries, login, and installation id from the stored doc.
+        next.github = { ...prev.github, accessToken: diskGithubToken };
+        entry.ghToken = diskGithubToken;
+      }
+
+      await this.store.putSecret(slackUserId, JSON.stringify(next));
+
+      getLog().info(
+        {
+          slackUserId: maskUid(slackUserId),
+          anthropicRotated: anthropicChanged,
+          githubRotated: githubChanged,
+        },
+        'user-creds.sync_from_disk_rotated'
+      );
+      return { rotated: true };
+    } catch (err) {
+      getLog().warn({ err, slackUserId: maskUid(slackUserId) }, 'user-creds.sync_from_disk_failed');
+      return { rotated: false };
+    }
+  }
+
+  /**
+   * Refresh the user's GitHub OAuth access token if it is at or near
+   * expiry. Called by the orchestrator before the env-build step so the
+   * subprocess receives a fresh `GH_TOKEN`.
+   *
+   * GitHub access tokens live ~8h and the binary doesn't refresh for us,
+   * so Archon owns the refresh flow. Does nothing when the user has no
+   * GitHub creds, when no expiry is recorded, or when the token still has
+   * more than `GITHUB_REFRESH_LEAD_MS` of life. Refresh is a no-op when
+   * the stored doc has no `refreshToken`.
+   *
+   * On a 401 from GitHub the refresh chain is dead — we tombstone the
+   * user so the next request falls through to the not-linked path. All
+   * other failures are transient: the cache is left untouched and the
+   * next call retries.
+   */
+  async ensureFreshGithub(slackUserId: string): Promise<void> {
+    const entry = this.cache.get(slackUserId);
+    if (!entry?.ghToken) return; // not linked
+    const expiresAtSec = entry.ghTokenExpiresAt;
+    if (!expiresAtSec) return; // unknown / never-expires — leave alone
+
+    const expiresAtMs = expiresAtSec * 1000;
+    if (expiresAtMs - this.clock() > GITHUB_REFRESH_LEAD_MS) return; // still fresh
+
+    let creds: UserCreds;
+    try {
+      const json = await this.store.getSecret(slackUserId);
+      if (!json) return;
+      creds = JSON.parse(json) as UserCreds;
+    } catch (err) {
+      getLog().warn(
+        { err, slackUserId: maskUid(slackUserId) },
+        'user-creds.github_refresh_load_failed'
+      );
+      return;
+    }
+
+    const refreshToken = creds.github?.refreshToken;
+    if (!refreshToken) {
+      // Nothing to refresh against. Drop the expiry hint so we don't loop.
+      entry.ghTokenExpiresAt = undefined;
+      return;
+    }
+
+    const result = await this.githubRefresh(refreshToken);
+    if (result.status === 401) {
+      await this.markRefreshChainDead(slackUserId, 'github');
+      return;
+    }
+    if (!result.ok || !result.accessToken) {
+      getLog().warn(
+        { slackUserId: maskUid(slackUserId), status: result.status },
+        'user-creds.github_refresh_transient_failed'
+      );
+      return;
+    }
+
+    if (!creds.github) return; // defensive — refreshToken implies github
+
+    const merged: GithubCreds = {
+      ...creds.github,
+      accessToken: result.accessToken,
+      refreshToken: result.refreshToken ?? creds.github.refreshToken,
+      expiresAt: result.expiresAt ?? creds.github.expiresAt,
+      refreshExpiresAt: result.refreshExpiresAt ?? creds.github.refreshExpiresAt,
+    };
+    const next: UserCreds = { ...creds, github: merged };
+
+    try {
+      await this.store.putSecret(slackUserId, JSON.stringify(next));
+    } catch (err) {
+      // Persistence failed but the new token is still in our hands. Log,
+      // materialize so the in-flight request gets the fresh token, and
+      // accept that the next bootstrap might re-issue from a stale secret.
+      getLog().warn(
+        { err, slackUserId: maskUid(slackUserId) },
+        'user-creds.github_refresh_persist_failed'
+      );
+    }
+    await this.materialize(slackUserId, next);
+    getLog().info(
+      { slackUserId: maskUid(slackUserId), expiresAt: merged.expiresAt },
+      'user-creds.github_refresh_completed'
+    );
+  }
+
+  /**
+   * Mark a user's refresh chain dead. Clears the cache entry, removes the
+   * per-user dotfiles (best-effort), and writes an empty tombstone doc to
+   * the store so bootstrap will not re-materialize stale tokens.
+   *
+   * Re-linking via `/archon-creds <provider>` overwrites the tombstone via
+   * the normal upsert path.
+   */
+  private async markRefreshChainDead(
+    slackUserId: string,
+    provider: 'anthropic' | 'github'
+  ): Promise<void> {
+    getLog().warn({ slackUserId: maskUid(slackUserId), provider }, 'user-creds.refresh_chain_dead');
+    const entry = this.cache.get(slackUserId);
+    this.cache.delete(slackUserId);
+    if (entry) {
+      // Best-effort dotfile cleanup. Don't take a worker down because the
+      // home dir is missing or unwritable.
+      const filesToRemove = [
+        join(entry.home, '.claude', '.credentials.json'),
+        join(entry.home, '.git-credentials'),
+        join(entry.home, '.gitconfig'),
+      ];
+      for (const f of filesToRemove) {
+        try {
+          await rm(f, { force: true });
+        } catch (err) {
+          getLog().debug(
+            { err, slackUserId: maskUid(slackUserId), file: f },
+            'user-creds.tombstone_unlink_failed'
+          );
+        }
+      }
+    }
+    try {
+      // Empty doc — `getEnvOverlay` already returns null when the cache is
+      // empty; this just makes the next bootstrap a no-op for this user.
+      await this.store.putSecret(slackUserId, JSON.stringify({}));
+    } catch (err) {
+      getLog().warn(
+        { err, slackUserId: maskUid(slackUserId), provider },
+        'user-creds.tombstone_persist_failed'
+      );
+    }
+  }
+
+  /**
    * Returns the in-memory cache as a snapshot — primarily for diagnostic
    * endpoints / tests. Never includes raw cred material.
    */
@@ -454,6 +798,65 @@ function parseAnthropicJson(raw: string): ParseResult {
   };
 }
 
+/**
+ * Parse the on-disk Claude credentials file.
+ *
+ * Returns null on any structural problem (missing claudeAiOauth, missing
+ * accessToken, malformed JSON). `syncFromDisk` treats null as "nothing to
+ * persist" rather than as an error.
+ */
+function parseClaudeCredentialsFile(text: string): AnthropicCreds | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object') return null;
+  const root = parsed as Record<string, unknown>;
+  // The file may be the raw `claudeAiOauth` object or our materialized shape
+  // (a wrapper containing the oauth block). Materialize() writes the wrapped
+  // shape, but accept either to stay robust against future SDK changes.
+  const oauthBlock =
+    root.claudeAiOauth && typeof root.claudeAiOauth === 'object'
+      ? (root.claudeAiOauth as Record<string, unknown>)
+      : root;
+  const accessToken = oauthBlock.accessToken;
+  if (typeof accessToken !== 'string' || accessToken.length === 0) return null;
+  return {
+    claudeAiOauth: {
+      accessToken,
+      refreshToken: pickStringField(oauthBlock, 'refreshToken'),
+      expiresAt: pickNumberField(oauthBlock, 'expiresAt'),
+      scopes: pickStringArrayField(oauthBlock, 'scopes'),
+      subscriptionType: pickStringField(oauthBlock, 'subscriptionType'),
+    },
+    accountEmail: pickStringField(root, 'accountEmail'),
+  };
+}
+
+/**
+ * Extract the access token from a `.git-credentials` file. Format written
+ * by `materialize()` and by git's `credential.helper=store`:
+ * `https://x-access-token:<token>@github.com\n`.
+ *
+ * Returns null when no github.com line is present.
+ */
+function parseGitCredentialsFile(text: string): string | null {
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const match = /^https:\/\/x-access-token:([^@]+)@github\.com\b/.exec(trimmed);
+    if (match) return match[1];
+  }
+  return null;
+}
+
+/** True iff the error is an ENOENT (file not found). */
+function isFileMissing(err: unknown): boolean {
+  return (err as NodeJS.ErrnoException | undefined)?.code === 'ENOENT';
+}
+
 function pickStringField(o: Record<string, unknown>, key: string): string | undefined {
   const v = o[key];
   return typeof v === 'string' ? v : undefined;
@@ -480,7 +883,7 @@ function maskUid(uid: string): string {
 }
 
 export { maskUid };
-export type { ISecretStore } from './secret-store';
+export type { ISecretStore, SecretId } from './secret-store';
 export { InMemorySecretStore } from './secret-store';
 export type {
   UserCreds,

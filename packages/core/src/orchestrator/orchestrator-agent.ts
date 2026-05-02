@@ -864,6 +864,14 @@ export async function handleMessage(
     // only present when the server has bootstrapped one — CLI and isolated
     // tests fall back to the static map.
     const userCreds = getUserCredsService();
+    if (platformUserId && userCreds) {
+      // GitHub access tokens expire ~8h and the binary doesn't refresh
+      // them for us. Refresh ahead of the env build so the spawn picks up
+      // a fresh GH_TOKEN. ensureFreshGithub no-ops when nothing's near
+      // expiry (the common case) — the I/O cost is paid only when the
+      // token is actually due.
+      await userCreds.ensureFreshGithub(platformUserId);
+    }
     const liveOverlay =
       platformUserId && userCreds ? (userCreds.getEnvOverlay(platformUserId) ?? null) : null;
     const userEnvVarsMap = config.userEnvVars ?? {};
@@ -891,38 +899,52 @@ export async function handleMessage(
     };
 
     const mode = platform.getStreamingMode();
-    if (mode === 'stream') {
-      await handleStreamMode(
-        platform,
-        conversationId,
-        message,
-        codebases,
-        workflows,
-        aiClient,
-        fullPrompt,
-        cwd,
-        session,
-        isolationHints,
-        conversation,
-        issueContext,
-        requestOptions
-      );
-    } else {
-      await handleBatchMode(
-        platform,
-        conversationId,
-        message,
-        codebases,
-        workflows,
-        aiClient,
-        fullPrompt,
-        cwd,
-        session,
-        isolationHints,
-        conversation,
-        issueContext,
-        requestOptions
-      );
+    try {
+      if (mode === 'stream') {
+        await handleStreamMode(
+          platform,
+          conversationId,
+          message,
+          codebases,
+          workflows,
+          aiClient,
+          fullPrompt,
+          cwd,
+          session,
+          isolationHints,
+          conversation,
+          issueContext,
+          requestOptions
+        );
+      } else {
+        await handleBatchMode(
+          platform,
+          conversationId,
+          message,
+          codebases,
+          workflows,
+          aiClient,
+          fullPrompt,
+          cwd,
+          session,
+          isolationHints,
+          conversation,
+          issueContext,
+          requestOptions
+        );
+      }
+    } finally {
+      // The Claude subprocess may have rotated Anthropic OAuth tokens by
+      // rewriting <HOME>/.claude/.credentials.json mid-run. Capture any
+      // change and persist back to the store — fire-and-forget so the
+      // response is not blocked. Runs on both success and error paths
+      // because a refresh can fire before the request errors.
+      if (platformUserId && userCreds) {
+        const uid = platformUserId;
+        void userCreds.syncFromDisk(uid).catch(err => {
+          getLog().warn({ err, slackUserId: uid }, 'user-creds.sync_from_disk_failed');
+        });
+      }
     }
 
     getLog().debug({ conversationId }, 'orchestrator_message_completed');

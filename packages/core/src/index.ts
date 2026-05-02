@@ -126,6 +126,7 @@ export {
 } from './services/user-creds';
 export type {
   ISecretStore,
+  SecretId,
   UserCreds,
   UserEnvOverlay,
   AnthropicCreds,

@@ -82,6 +82,7 @@ import {
 } from '@archon/core';
 import type { IPlatformAdapter } from '@archon/core';
 import { InMemoryOAuthStateStore } from './oauth-state-store';
+import { AwsSecretsManagerStore } from './services/aws-secrets-store';
 import {
   buildGithubAuthorizeUrl,
   handleGithubOAuthCallback,
@@ -251,10 +252,18 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
   // Patch 3 / Phase A.1: bootstrap the per-user creds service. Runs before
   // any platform adapter so the orchestrator's env-overlay lookup sees a
-  // populated cache. The default in-memory store is fine for single-task
-  // local dev — production AWS deployments wire an `ISecretStore` backed
-  // by Secrets Manager from the deployment package.
-  const userCreds = new UserCredsService();
+  // populated cache. `USER_CREDS_SECRET_PREFIX` selects AWS Secrets Manager
+  // (production / staging); unset falls through to the in-memory store
+  // (local dev, CLI, isolated tests). Same env-driven pattern as
+  // `ALB_OIDC_REGION`.
+  const userCredsPrefix = process.env.USER_CREDS_SECRET_PREFIX?.trim();
+  const userCreds = userCredsPrefix
+    ? new UserCredsService({ store: new AwsSecretsManagerStore({ prefix: userCredsPrefix }) })
+    : new UserCredsService();
+  getLog().info(
+    { backend: userCredsPrefix ? 'aws-secrets-manager' : 'in-memory', prefix: userCredsPrefix },
+    'user-creds.store_configured'
+  );
   await userCreds.bootstrap();
   setUserCredsService(userCreds);
 
