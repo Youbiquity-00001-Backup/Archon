@@ -750,9 +750,10 @@ export class UserCredsService {
 type ParseResult = { ok: true; creds: AnthropicCreds } | { ok: false; error: string };
 
 /**
- * Validate the JSON pasted by a user via `/archon-creds anthropic <json>`.
- * Accepts either the full `.credentials.json` document (with top-level
- * `claudeAiOauth`) or a wrapper containing it.
+ * Validate the JSON pasted by a user into the Connect Anthropic modal
+ * (opened by `/archon-creds anthropic`). Accepts either the full
+ * `.credentials.json` document (with top-level `claudeAiOauth`) or a
+ * wrapper containing it.
  */
 function parseAnthropicJson(raw: string): ParseResult {
   let parsed: unknown;
@@ -763,7 +764,7 @@ function parseAnthropicJson(raw: string): ParseResult {
       ok: false,
       error:
         'That JSON did not parse. Paste the full contents of `~/.claude/.credentials.json` ' +
-        '(no extra text), e.g. `/archon-creds anthropic {...}`.',
+        '(no extra text) into the modal opened by `/archon-creds anthropic`.',
     };
   }
   if (!parsed || typeof parsed !== 'object') {

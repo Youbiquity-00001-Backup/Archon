@@ -268,8 +268,10 @@ function EnvVarsPanel({ codebaseId }: { codebaseId: string }): React.ReactElemen
  * scoped to the signed-in user's own account links.
  *
  * Triggers for both kinds of (re)linking are intentionally NOT in the SPA:
- *  - Anthropic uses `/archon-creds anthropic <json>` in Slack DM (paste-in-
- *    web is awkward UX, slash-command flow is already proven).
+ *  - Anthropic uses `/archon-creds anthropic` in Slack DM, which opens a
+ *    Slack modal for pasting `~/.claude/.credentials.json` (paste-in-web
+ *    is awkward UX; the modal also keeps the JSON out of slash-command
+ *    text that Slack logs).
  *  - GitHub uses `/auth/github/initiate` which 302-redirects to GitHub.
  *    The "Link GitHub" button below navigates straight to that endpoint.
  */
@@ -309,7 +311,8 @@ function AccountConnectionsSection(): React.ReactElement {
                 </div>
               ) : (
                 <div className="text-xs text-muted-foreground">
-                  Not linked. Run <code>/archon-creds anthropic …</code> in Slack DM.
+                  Not linked. Run <code>/archon-creds anthropic</code> in Slack DM and paste your{' '}
+                  <code>~/.claude/.credentials.json</code> into the modal that opens.
                 </div>
               )}
             </div>

@@ -3,6 +3,7 @@
  * Handles message sending with markdown block formatting for AI responses
  */
 import { App, LogLevel } from '@slack/bolt';
+import type { View } from '@slack/types';
 import type { IPlatformAdapter, MessageMetadata } from '@archon/core';
 import { createLogger } from '@archon/paths';
 import { isSlackUserAuthorized } from './auth';
@@ -25,18 +26,50 @@ const MAX_MARKDOWN_BLOCK_LENGTH = 12000; // Slack markdown block limit
  *   slash-command payload).
  * - `text` is the part after the command name, untrimmed verbatim.
  * - `isDM` is true iff the command was issued from the bot DM channel; some
- *   commands (notably `/archon-creds anthropic <json>`) refuse to run in
+ *   commands (notably `/archon-creds anthropic`) refuse to run in
  *   public channels for obvious reasons.
+ * - `triggerId` is Slack's short-lived (3s) token for opening modals via
+ *   `views.open`. Always present in Bolt's slash-command payload.
  *
  * Handler returns the reply text and whether it should be ephemeral
- * (visible only to the invoker). Errors thrown by the handler are caught,
- * logged, and surfaced to the user as a generic ephemeral message.
+ * (visible only to the invoker). When `replyText` is omitted/empty the
+ * adapter skips the `respond()` call — used by handlers that open a
+ * modal instead of replying inline. Errors thrown by the handler are
+ * caught, logged, and surfaced to the user as a generic ephemeral
+ * message.
  */
 export type SlashCommandHandler = (
   slackUserId: string,
   text: string,
-  isDM: boolean
-) => Promise<{ replyText: string; ephemeral?: boolean }>;
+  isDM: boolean,
+  triggerId: string
+) => Promise<{ replyText?: string; ephemeral?: boolean }>;
+
+/**
+ * Subset of a Slack `view` payload that view_submission handlers care
+ * about. Modeled narrow on purpose so handlers don't grow accidental
+ * dependencies on Bolt's full `ViewOutput` type.
+ */
+export interface ViewSubmissionPayload {
+  state: {
+    values: Record<string, Record<string, { value?: string | null }>>;
+  };
+  private_metadata?: string;
+}
+
+/**
+ * Result returned by a view_submission handler:
+ * - `{ ok: true }` closes the modal.
+ * - `{ ok: false, errors }` keeps the modal open and shows inline
+ *   validation errors keyed by `block_id` (matches Slack's
+ *   `response_action: 'errors'` semantics).
+ */
+export type ViewSubmissionResult = { ok: true } | { ok: false; errors: Record<string, string> };
+
+export type ViewSubmissionHandler = (
+  slackUserId: string,
+  view: ViewSubmissionPayload
+) => Promise<ViewSubmissionResult>;
 
 export class SlackAdapter implements IPlatformAdapter {
   private app: App;
@@ -49,6 +82,12 @@ export class SlackAdapter implements IPlatformAdapter {
    * (same pattern as `onMessage()`). `start()` wires each entry into Bolt.
    */
   private slashHandlers = new Map<string, SlashCommandHandler>();
+  /**
+   * Map of modal `callback_id` → view_submission handler. Same lifecycle as
+   * `slashHandlers`: register before `start()`, which wires each entry
+   * into `app.view()`.
+   */
+  private viewHandlers = new Map<string, ViewSubmissionHandler>();
 
   constructor(botToken: string, appToken: string, mode: 'stream' | 'batch' = 'batch') {
     this.app = new App({
@@ -285,6 +324,82 @@ export class SlackAdapter implements IPlatformAdapter {
   }
 
   /**
+   * Open a Slack modal. Thin wrapper around `app.client.views.open` so
+   * callers don't need to reach into Bolt. `trigger_id` from a slash
+   * command / block_action is good for ~3 seconds, so the caller should
+   * invoke this synchronously inside its handler.
+   */
+  async openView(triggerId: string, view: View): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const r = await this.app.client.views.open({ trigger_id: triggerId, view });
+      if (!r.ok) {
+        getLog().warn({ error: r.error }, 'slack.views_open_failed');
+        return { ok: false, error: r.error ?? 'unknown' };
+      }
+      return { ok: true };
+    } catch (err) {
+      getLog().error({ err }, 'slack.views_open_threw');
+      return { ok: false, error: (err as Error).message };
+    }
+  }
+
+  /**
+   * Register a view_submission handler keyed by the modal's `callback_id`.
+   * Must be called before `start()` — that's where the adapter wires
+   * Bolt's `app.view()` so the receiver knows about it.
+   *
+   * Authorization uses the same allowlist as `onMessage`/`onSlashCommand`;
+   * unauthorized submissions silently close the modal (empty `ack()`).
+   */
+  onViewSubmission(callbackId: string, handler: ViewSubmissionHandler): void {
+    if (!callbackId) {
+      throw new Error('View callback_id must be a non-empty string');
+    }
+    if (this.viewHandlers.has(callbackId)) {
+      throw new Error(`View handler already registered: ${callbackId}`);
+    }
+    this.viewHandlers.set(callbackId, handler);
+  }
+
+  /**
+   * Wire every registered view_submission handler into Bolt. Called from
+   * `start()` exactly once.
+   */
+  private registerViewHandlersInternal(): void {
+    for (const [callbackId, handler] of this.viewHandlers.entries()) {
+      this.app.view(callbackId, async ({ ack, body, view }) => {
+        const userId = body.user?.id ?? '';
+        if (!isSlackUserAuthorized(userId, this.allowedUserIds)) {
+          const masked = userId ? `${userId.slice(0, 4)}***` : 'unknown';
+          getLog().info({ callbackId, maskedUserId: masked }, 'slack.unauthorized_view_submission');
+          // Empty ack() closes the modal silently — same shape as the
+          // success path so we don't leak whether a callback_id is wired.
+          await ack();
+          return;
+        }
+        try {
+          const payload: ViewSubmissionPayload = {
+            state: { values: view.state.values as ViewSubmissionPayload['state']['values'] },
+            private_metadata: view.private_metadata,
+          };
+          const result = await handler(userId, payload);
+          if (result.ok) {
+            await ack();
+          } else {
+            await ack({ response_action: 'errors', errors: result.errors });
+          }
+        } catch (err) {
+          getLog().error({ err, callbackId }, 'slack.view_submission_handler_failed');
+          // Closing the modal silently on unexpected errors is the least
+          // confusing outcome for the user — the alternative (sticky
+          // modal with a generic error) blocks them from retrying.
+          await ack();
+        }
+      });
+    }
+  }
+
+  /**
    * Wire every registered slash-command handler into Bolt. Called from
    * `start()` exactly once; idempotent because `onSlashCommand()` rejects
    * duplicate names.
@@ -308,11 +423,17 @@ export class SlackAdapter implements IPlatformAdapter {
           }
           const isDM = command.channel_name === 'directmessage';
           const text = command.text ?? '';
-          const result = await handler(userId, text, isDM);
-          await respond({
-            response_type: result.ephemeral === false ? 'in_channel' : 'ephemeral',
-            text: result.replyText,
-          });
+          const triggerId = command.trigger_id ?? '';
+          const result = await handler(userId, text, isDM, triggerId);
+          // Empty/missing replyText means the handler took some other
+          // visible action (e.g. opened a modal via views.open) and
+          // doesn't want a slash-command reply on top.
+          if (result.replyText) {
+            await respond({
+              response_type: result.ephemeral === false ? 'in_channel' : 'ephemeral',
+              text: result.replyText,
+            });
+          }
         } catch (err) {
           // Bolt will log this too, but a structured log line lives with our
           // other slack.* events for grep-ability.
@@ -335,6 +456,7 @@ export class SlackAdapter implements IPlatformAdapter {
     // registration order vs. start() doesn't strictly matter — but doing it
     // here keeps the `onSlashCommand()` API symmetric with `onMessage()`.)
     this.registerSlashCommandsInternal();
+    this.registerViewHandlersInternal();
 
     // Register app_mention event handler (when bot is @mentioned)
     this.app.event('app_mention', async ({ event }) => {

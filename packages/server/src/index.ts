@@ -57,7 +57,16 @@ import { OpenAPIHono } from '@hono/zod-openapi';
 import { timingSafeEqual } from 'node:crypto';
 import { validationErrorHook } from './routes/openapi-defaults';
 import { setAcceptingNewWork } from './drain-state';
-import { TelegramAdapter, GitHubAdapter, DiscordAdapter, SlackAdapter } from '@archon/adapters';
+import {
+  TelegramAdapter,
+  GitHubAdapter,
+  DiscordAdapter,
+  SlackAdapter,
+  anthropicCredsModal,
+  CALLBACK_ANTHROPIC_CREDS,
+  BLOCK_ANTHROPIC_CREDS_INPUT,
+  ACTION_ANTHROPIC_CREDS_VALUE,
+} from '@archon/adapters';
 import { GiteaAdapter } from '@archon/adapters/community/forge/gitea';
 import { GitLabAdapter } from '@archon/adapters/community/forge/gitlab';
 import { WebAdapter } from './adapters/web';
@@ -483,10 +492,9 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       // ephemeral by default — these flows handle credentials, the user
       // never wants the channel to see them.
 
-      slackAdapter.onSlashCommand('/archon-creds', async (slackUserId, text, isDM) => {
-        const trimmed = text.trim();
-        const [sub, ...rest] = trimmed.split(/\s+/);
-        const argText = rest.join(' ').trim();
+      slackAdapter.onSlashCommand('/archon-creds', async (slackUserId, text, isDM, triggerId) => {
+        const [subRaw] = text.trim().split(/\s+/);
+        const sub = (subRaw ?? '').toLowerCase();
 
         if (sub === 'anthropic') {
           if (!isDM) {
@@ -495,15 +503,19 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
                 'Run this in a DM with me — channels are public, your `.credentials.json` is not.',
             };
           }
-          if (!argText) {
+          // Open the paste-credentials modal. Mirrors the cred-paste UX
+          // in llm-slack-channel-bridge: keeps the JSON out of slash-
+          // command text (which Slack logs and renders inline) and gives
+          // us inline validation via response_action: errors. Empty
+          // replyText so the slash command returns silently and the
+          // modal is the user-visible action.
+          const r = await slackAdapter.openView(triggerId, anthropicCredsModal());
+          if (!r.ok) {
             return {
-              replyText:
-                'Usage: `/archon-creds anthropic <paste credentials.json contents>` ' +
-                '(run `claude /login` to refresh first).',
+              replyText: `Couldn't open the credentials modal: \`${r.error ?? 'unknown'}\``,
             };
           }
-          const result = await userCreds.upsertAnthropic(slackUserId, argText);
-          return { replyText: result.replyText };
+          return { replyText: '' };
         }
 
         if (sub === 'github') {
@@ -525,8 +537,73 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         }
 
         return {
-          replyText: 'Usage: `/archon-creds anthropic <json>` or `/archon-creds github`.',
+          replyText: 'Usage: `/archon-creds anthropic` (opens a modal) or `/archon-creds github`.',
         };
+      });
+
+      // view_submission for the Connect Anthropic modal opened above.
+      // Shape-validates inline (JSON.parse + claudeAiOauth.accessToken
+      // check) so paste errors keep the modal open with a per-block
+      // error. Persistence (which also re-validates and probes the
+      // Anthropic API) runs fire-and-forget after the modal closes;
+      // the result reaches the user via DM. Matches the cred-paste
+      // flow in llm-slack-channel-bridge/packages/cloud-edge/src/
+      // interactivity.ts.
+      slackAdapter.onViewSubmission(CALLBACK_ANTHROPIC_CREDS, async (slackUserId, view) => {
+        const raw =
+          view.state.values?.[BLOCK_ANTHROPIC_CREDS_INPUT]?.[ACTION_ANTHROPIC_CREDS_VALUE]?.value ??
+          '';
+        const trimmed = raw.trim();
+        if (!trimmed) {
+          return {
+            ok: false,
+            errors: { [BLOCK_ANTHROPIC_CREDS_INPUT]: 'Paste a credentials.json blob.' },
+          };
+        }
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(trimmed);
+        } catch (err) {
+          return {
+            ok: false,
+            errors: {
+              [BLOCK_ANTHROPIC_CREDS_INPUT]: `Not valid JSON: ${(err as Error).message}`,
+            },
+          };
+        }
+        const oauth =
+          parsed && typeof parsed === 'object'
+            ? ((parsed as Record<string, unknown>).claudeAiOauth as
+                | Record<string, unknown>
+                | undefined)
+            : undefined;
+        if (!oauth || typeof oauth.accessToken !== 'string' || oauth.accessToken.length === 0) {
+          return {
+            ok: false,
+            errors: {
+              [BLOCK_ANTHROPIC_CREDS_INPUT]:
+                "JSON parsed but doesn't look like a credentials.json — expected " +
+                '`claudeAiOauth.accessToken`. Run `claude /login` to refresh.',
+            },
+          };
+        }
+
+        // Close the modal now; persist + DM the user the outcome async.
+        // upsertAnthropic re-validates and probes the Anthropic API,
+        // which can take a couple of seconds — too slow to block the
+        // view_submission ack window.
+        void (async (): Promise<void> => {
+          try {
+            const result = await userCreds.upsertAnthropic(slackUserId, trimmed);
+            await slackAdapter.sendMessage(slackUserId, result.replyText);
+          } catch (err) {
+            await slackAdapter.sendMessage(
+              slackUserId,
+              `Failed to save Anthropic credentials: ${(err as Error).message}`
+            );
+          }
+        })();
+        return { ok: true };
       });
 
       slackAdapter.onSlashCommand('/archon-codebase', async (slackUserId, text) => {
