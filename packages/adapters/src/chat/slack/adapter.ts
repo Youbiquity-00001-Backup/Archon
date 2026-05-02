@@ -299,10 +299,7 @@ export class SlackAdapter implements IPlatformAdapter {
           const userId = command.user_id;
           if (!isSlackUserAuthorized(userId, this.allowedUserIds)) {
             const masked = userId ? `${userId.slice(0, 4)}***` : 'unknown';
-            getLog().info(
-              { name, maskedUserId: masked },
-              'slack.unauthorized_slash_command'
-            );
+            getLog().info({ name, maskedUserId: masked }, 'slack.unauthorized_slash_command');
             await respond({
               response_type: 'ephemeral',
               text: 'You are not authorized to use this command.',

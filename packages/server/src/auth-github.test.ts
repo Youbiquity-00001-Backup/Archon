@@ -106,9 +106,7 @@ describe('handleGithubOAuthCallback', () => {
       userCreds: svc,
       tokenExchange: async () => ({ access_token: 'x' }),
     });
-    const res = await app.request(
-      '/auth/github/callback?code=c&state=does-not-exist'
-    );
+    const res = await app.request('/auth/github/callback?code=c&state=does-not-exist');
     expect(res.status).toBe(400);
     expect(await res.text()).toMatch(/expired or already used/);
   });
@@ -128,9 +126,7 @@ describe('handleGithubOAuthCallback', () => {
       userCreds: svc,
       tokenExchange,
     });
-    const res = await app.request(
-      `/auth/github/callback?code=anycode&state=${state}`
-    );
+    const res = await app.request(`/auth/github/callback?code=anycode&state=${state}`);
     expect(res.status).toBe(400);
     expect(await res.text()).toMatch(/incorrect or expired/);
   });

@@ -2119,11 +2119,7 @@ export function registerApiRoutes(
       // `parent_conversation_id` on the run (set by orchestrator-agent for any
       // web-dispatched workflow — foreground, interactive, and background via
       // the pre-created run) and a web-platform parent (guarded in the helper).
-      const autoResumed = await tryAutoResumeAfterGate(
-        run,
-        'approve',
-        getIdentity(c)?.slackUserId
-      );
+      const autoResumed = await tryAutoResumeAfterGate(run, 'approve', getIdentity(c)?.slackUserId);
 
       return c.json({
         success: true,

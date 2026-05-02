@@ -391,9 +391,9 @@ describe('SlackAdapter', () => {
     });
 
     test('rejects names without a leading slash', () => {
-      expect(() => adapter.onSlashCommand('archon-creds', async () => ({ replyText: 'x' }))).toThrow(
-        /must start with/
-      );
+      expect(() =>
+        adapter.onSlashCommand('archon-creds', async () => ({ replyText: 'x' }))
+      ).toThrow(/must start with/);
     });
 
     test('refuses duplicate registrations', () => {
