@@ -346,6 +346,21 @@ function AccountConnectionsSection(): React.ReactElement {
                 </div>
               )}
             </div>
+
+            <div>
+              <div className="font-medium">Jira</div>
+              {data.jira.linked ? (
+                <div className="text-xs text-muted-foreground">
+                  Linked as <span className="font-mono">{data.jira.email}</span> on{' '}
+                  <span className="font-mono">{data.jira.baseUrl}</span>
+                </div>
+              ) : (
+                <div className="text-xs text-muted-foreground">
+                  Not linked. Run <code>/archon-creds jira</code> in Slack DM and paste your tenant
+                  URL, Atlassian email, and API token into the modal that opens.
+                </div>
+              )}
+            </div>
           </>
         )}
       </CardContent>

@@ -26,6 +26,7 @@ import type {
   AnthropicCreds,
   ConnectionStatus,
   GithubCreds,
+  JiraCreds,
   UserCreds,
   UserEnvOverlay,
   UpsertResult,
@@ -57,6 +58,9 @@ interface CacheEntry {
    * API key — must be injected as the OAuth env var, not as
    * `ANTHROPIC_API_KEY` (Anthropic 401s OAuth tokens sent as API keys). */
   anthropicAccessToken?: string;
+  jiraBaseUrl?: string;
+  jiraEmail?: string;
+  jiraApiToken?: string;
 }
 
 /** Optional dependencies for testability and deployment-specific wiring. */
@@ -78,6 +82,12 @@ export interface UserCredsServiceOptions {
    * fetch against `GET https://api.github.com/user`. Tests inject a stub.
    */
   githubProbe?: GithubProbe;
+  /**
+   * Probe function for validating Jira API tokens. Defaults to a real
+   * fetch against `GET {baseUrl}/rest/api/3/myself` with Basic auth.
+   * Tests inject a stub.
+   */
+  jiraProbe?: JiraProbe;
   /**
    * Refresh-token exchange used by `ensureFreshGithub`. Defaults to a real
    * POST to GitHub's OAuth token endpoint. Tests inject a stub.
@@ -101,6 +111,12 @@ export type GithubProbe = (accessToken: string) => Promise<{
   login?: string;
   status?: number;
 }>;
+
+export type JiraProbe = (input: {
+  baseUrl: string;
+  email: string;
+  apiToken: string;
+}) => Promise<{ ok: boolean; status?: number }>;
 
 /**
  * Result of exchanging a refresh token at GitHub's token endpoint.
@@ -136,6 +152,28 @@ const defaultAnthropicProbe: AnthropicProbe = async accessToken => {
     return { ok: true, accountEmail: body.account?.email, status: res.status };
   } catch (err) {
     getLog().warn({ err }, 'user-creds.anthropic_probe_threw');
+    return { ok: false };
+  }
+};
+
+/**
+ * Default Jira probe — Basic auth against `/rest/api/3/myself`.
+ *
+ * Atlassian API tokens are paired with the account email as the username:
+ *   `Authorization: Basic base64(email:apiToken)`
+ *
+ * 401/403 indicate bad creds (reject); 5xx / network errors are reported as
+ * a generic failure (caller surfaces the status).
+ */
+const defaultJiraProbe: JiraProbe = async ({ baseUrl, email, apiToken }) => {
+  try {
+    const auth = Buffer.from(`${email}:${apiToken}`).toString('base64');
+    const res = await fetch(`${baseUrl}/rest/api/3/myself`, {
+      headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' },
+    });
+    return { ok: res.ok, status: res.status };
+  } catch (err) {
+    getLog().warn({ err }, 'user-creds.jira_probe_threw');
     return { ok: false };
   }
 };
@@ -225,6 +263,7 @@ export class UserCredsService {
   private readonly anthropicProbe: AnthropicProbe;
   private readonly githubProbe: GithubProbe;
   private readonly githubRefresh: GithubRefresh;
+  private readonly jiraProbe: JiraProbe;
   private readonly clock: () => number;
   private bootstrapped = false;
 
@@ -234,6 +273,7 @@ export class UserCredsService {
     this.anthropicProbe = opts.anthropicProbe ?? defaultAnthropicProbe;
     this.githubProbe = opts.githubProbe ?? defaultGithubProbe;
     this.githubRefresh = opts.githubRefresh ?? defaultGithubRefresh;
+    this.jiraProbe = opts.jiraProbe ?? defaultJiraProbe;
     this.clock = opts.clock ?? Date.now;
   }
 
@@ -256,7 +296,7 @@ export class UserCredsService {
         // a `HOME`-only cache entry would point the spawn at an empty per-user
         // dir and break the global-auth fallback. The user re-links via
         // `/archon-creds <provider>` when they're ready.
-        if (!creds.anthropic && !creds.github) continue;
+        if (!creds.anthropic && !creds.github && !creds.jira) continue;
         await this.materialize(id, creds);
         materializedCount++;
       } catch (err) {
@@ -288,6 +328,9 @@ export class UserCredsService {
     // tokens sent through ANTHROPIC_API_KEY with 401 "Invalid
     // authentication credentials".
     if (entry.anthropicAccessToken) overlay.CLAUDE_CODE_OAUTH_TOKEN = entry.anthropicAccessToken;
+    if (entry.jiraBaseUrl) overlay.JIRA_BASE_URL = entry.jiraBaseUrl;
+    if (entry.jiraEmail) overlay.JIRA_EMAIL = entry.jiraEmail;
+    if (entry.jiraApiToken) overlay.JIRA_API_TOKEN = entry.jiraApiToken;
     return overlay;
   }
 
@@ -363,6 +406,45 @@ export class UserCredsService {
   }
 
   /**
+   * Persist Jira PAT creds for a user. Validates URL shape, probes
+   * `/rest/api/3/myself` with Basic auth, persists to the secret store, and
+   * updates the cache + env overlay. No filesystem materialization — Jira
+   * has no canonical dotfile; consumers read the three JIRA_* env vars.
+   */
+  async upsertJira(
+    slackUserId: string,
+    input: { baseUrl: string; email: string; apiToken: string }
+  ): Promise<UpsertResult> {
+    const parsed = parseJiraInputs(input);
+    if (!parsed.ok) {
+      return { replyText: parsed.error, persisted: false };
+    }
+
+    const probe = await this.jiraProbe(parsed.creds);
+    if (!probe.ok) {
+      const hint =
+        probe.status === 401 || probe.status === 403
+          ? 'Check the email + API token at id.atlassian.com → Security → API tokens.'
+          : 'Re-run `/archon-creds jira` and try again.';
+      return {
+        replyText: `Jira rejected the credential (status ${probe.status ?? 'unknown'}). ${hint}`,
+        persisted: false,
+      };
+    }
+
+    const merged = await this.mergeAndPersist(slackUserId, prev => ({
+      ...prev,
+      jira: parsed.creds,
+    }));
+    await this.materialize(slackUserId, merged);
+
+    return {
+      replyText: `Linked Jira at ${parsed.creds.baseUrl} as ${parsed.creds.email}.`,
+      persisted: true,
+    };
+  }
+
+  /**
    * Public-safe connection status for a user: which integrations are linked
    * and the cosmetic identifiers (account email / GitHub login) needed to
    * render the Settings → Connections page. Never includes raw cred
@@ -378,7 +460,11 @@ export class UserCredsService {
   async getConnectionStatus(slackUserId: string): Promise<ConnectionStatus> {
     const json = await this.store.getSecret(slackUserId);
     if (!json) {
-      return { anthropic: { linked: false }, github: { linked: false } };
+      return {
+        anthropic: { linked: false },
+        github: { linked: false },
+        jira: { linked: false },
+      };
     }
     let creds: UserCreds;
     try {
@@ -391,7 +477,11 @@ export class UserCredsService {
         { err, slackUserId: maskUid(slackUserId) },
         'user-creds.connection_status_parse_failed'
       );
-      return { anthropic: { linked: false }, github: { linked: false } };
+      return {
+        anthropic: { linked: false },
+        github: { linked: false },
+        jira: { linked: false },
+      };
     }
     return {
       anthropic: creds.anthropic
@@ -403,6 +493,9 @@ export class UserCredsService {
             login: creds.github.login,
             installationId: creds.github.installationId,
           }
+        : { linked: false },
+      jira: creds.jira
+        ? { linked: true, baseUrl: creds.jira.baseUrl, email: creds.jira.email }
         : { linked: false },
     };
   }
@@ -742,12 +835,22 @@ export class UserCredsService {
       cacheEntry.ghTokenExpiresAt = creds.github.expiresAt;
     }
 
+    if (creds.jira) {
+      // No on-disk dotfile — Jira creds reach subprocesses via env overlay
+      // only (JIRA_BASE_URL / JIRA_EMAIL / JIRA_API_TOKEN). Cache the values
+      // so getEnvOverlay() stays synchronous on the orchestrator hot path.
+      cacheEntry.jiraBaseUrl = creds.jira.baseUrl;
+      cacheEntry.jiraEmail = creds.jira.email;
+      cacheEntry.jiraApiToken = creds.jira.apiToken;
+    }
+
     this.cache.set(slackUserId, cacheEntry);
     getLog().info(
       {
         slackUserId: maskUid(slackUserId),
         hasGithub: Boolean(creds.github),
         hasAnthropic: Boolean(creds.anthropic),
+        hasJira: Boolean(creds.jira),
       },
       'user-creds.materialize_completed'
     );
@@ -806,6 +909,58 @@ function parseAnthropicJson(raw: string): ParseResult {
       },
     },
   };
+}
+
+type JiraParseResult = { ok: true; creds: JiraCreds } | { ok: false; error: string };
+
+/**
+ * Validate + normalize the three Jira inputs (base URL, email, API token).
+ *
+ * Rules:
+ *  - All three fields required (non-empty after trim).
+ *  - Base URL must start with `https://`.
+ *  - Base URL host must end with `.atlassian.net` (Jira Cloud tenant).
+ *  - Trailing slashes are stripped from the base URL.
+ *
+ * Self-hosted Jira DC is not accepted — it has different auth shapes
+ * (PAT-as-Bearer rather than Basic) and would change the probe contract.
+ */
+function parseJiraInputs(input: {
+  baseUrl: string;
+  email: string;
+  apiToken: string;
+}): JiraParseResult {
+  const baseUrlRaw = input.baseUrl.trim();
+  const email = input.email.trim();
+  const apiToken = input.apiToken.trim();
+
+  if (!baseUrlRaw) return { ok: false, error: 'Base URL is required.' };
+  if (!email) return { ok: false, error: 'Email is required.' };
+  if (!apiToken) return { ok: false, error: 'API token is required.' };
+
+  if (!baseUrlRaw.startsWith('https://')) {
+    return { ok: false, error: 'Base URL must start with `https://`.' };
+  }
+
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(baseUrlRaw);
+  } catch {
+    return { ok: false, error: 'Base URL is not a valid URL.' };
+  }
+
+  if (!parsedUrl.hostname.endsWith('.atlassian.net')) {
+    return {
+      ok: false,
+      error: 'Base URL host must end with `.atlassian.net` (Jira Cloud tenant).',
+    };
+  }
+
+  // Strip trailing slashes; preserve any non-trailing path the user typed
+  // (probe will fail loud if it's wrong).
+  const baseUrl = baseUrlRaw.replace(/\/+$/, '');
+
+  return { ok: true, creds: { baseUrl, email, apiToken } };
 }
 
 /**
@@ -900,6 +1055,7 @@ export type {
   UserEnvOverlay,
   AnthropicCreds,
   GithubCreds,
+  JiraCreds,
   UpsertResult,
   ConnectionStatus,
 } from './types';

@@ -536,9 +536,12 @@ export type GithubConnection =
   | { linked: false }
   | { linked: true; login: string; installationId?: number };
 
+export type JiraConnection = { linked: false } | { linked: true; baseUrl: string; email: string };
+
 export interface ConnectionsResponse {
   anthropic: AnthropicConnection;
   github: GithubConnection;
+  jira: JiraConnection;
 }
 
 /** Returns the current user identity, or null when not signed in (401). */

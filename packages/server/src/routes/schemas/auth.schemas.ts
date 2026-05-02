@@ -46,10 +46,25 @@ const githubConnectionSchema = z
   ])
   .openapi('GithubConnection');
 
+/** Jira section. PAT-style cred — no token material in the response. */
+const jiraConnectionSchema = z
+  .union([
+    z.object({ linked: z.literal(false) }),
+    z.object({
+      linked: z.literal(true),
+      /** Tenant base URL captured at upsert time. */
+      baseUrl: z.string(),
+      /** Atlassian account email captured at upsert time. */
+      email: z.string(),
+    }),
+  ])
+  .openapi('JiraConnection');
+
 /** Response for `GET /api/auth/connections`. */
 export const connectionsResponseSchema = z
   .object({
     anthropic: anthropicConnectionSchema,
     github: githubConnectionSchema,
+    jira: jiraConnectionSchema,
   })
   .openapi('ConnectionsResponse');

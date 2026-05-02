@@ -66,6 +66,14 @@ import {
   CALLBACK_ANTHROPIC_CREDS,
   BLOCK_ANTHROPIC_CREDS_INPUT,
   ACTION_ANTHROPIC_CREDS_VALUE,
+  jiraCredsModal,
+  CALLBACK_JIRA_CREDS,
+  BLOCK_JIRA_BASE_URL,
+  ACTION_JIRA_BASE_URL,
+  BLOCK_JIRA_EMAIL,
+  ACTION_JIRA_EMAIL,
+  BLOCK_JIRA_API_TOKEN,
+  ACTION_JIRA_API_TOKEN,
 } from '@archon/adapters';
 import { GiteaAdapter } from '@archon/adapters/community/forge/gitea';
 import { GitLabAdapter } from '@archon/adapters/community/forge/gitlab';
@@ -533,8 +541,23 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
           };
         }
 
+        if (sub === 'jira') {
+          // Three-input modal: tenant URL, account email, API token. Mirrors
+          // the anthropic modal pattern (silent return + modal as the
+          // user-visible action) — keeps the API token out of the slash-
+          // command text Slack logs.
+          const r = await slackAdapter.openView(triggerId, jiraCredsModal());
+          if (!r.ok) {
+            return {
+              replyText: `Couldn't open the Jira credentials modal: \`${r.error ?? 'unknown'}\``,
+            };
+          }
+          return { replyText: '' };
+        }
+
         return {
-          replyText: 'Usage: `/archon-creds anthropic` (opens a modal) or `/archon-creds github`.',
+          replyText:
+            'Usage: `/archon-creds anthropic` (opens a modal), `/archon-creds github`, or `/archon-creds jira` (opens a modal).',
         };
       });
 
@@ -597,6 +620,61 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
             await slackAdapter.sendMessage(
               slackUserId,
               `Failed to save Anthropic credentials: ${(err as Error).message}`
+            );
+          }
+        })();
+        return { ok: true };
+      });
+
+      // view_submission for the Connect Jira modal. Inline checks (empty
+      // fields, URL shape) keep the modal open with per-block errors;
+      // the API probe runs after the ack via `upsertJira` and DMs the user.
+      slackAdapter.onViewSubmission(CALLBACK_JIRA_CREDS, async (slackUserId, view) => {
+        const baseUrlRaw =
+          view.state.values?.[BLOCK_JIRA_BASE_URL]?.[ACTION_JIRA_BASE_URL]?.value ?? '';
+        const emailRaw = view.state.values?.[BLOCK_JIRA_EMAIL]?.[ACTION_JIRA_EMAIL]?.value ?? '';
+        const apiTokenRaw =
+          view.state.values?.[BLOCK_JIRA_API_TOKEN]?.[ACTION_JIRA_API_TOKEN]?.value ?? '';
+
+        const baseUrl = baseUrlRaw.trim();
+        const email = emailRaw.trim();
+        const apiToken = apiTokenRaw.trim();
+
+        const errors: Record<string, string> = {};
+        if (!baseUrl) errors[BLOCK_JIRA_BASE_URL] = 'Tenant URL is required.';
+        if (!email) errors[BLOCK_JIRA_EMAIL] = 'Email is required.';
+        if (!apiToken) errors[BLOCK_JIRA_API_TOKEN] = 'API token is required.';
+
+        if (!errors[BLOCK_JIRA_BASE_URL]) {
+          if (!baseUrl.startsWith('https://')) {
+            errors[BLOCK_JIRA_BASE_URL] = 'Tenant URL must start with `https://`.';
+          } else {
+            try {
+              const u = new URL(baseUrl);
+              if (!u.hostname.endsWith('.atlassian.net')) {
+                errors[BLOCK_JIRA_BASE_URL] =
+                  'Host must end with `.atlassian.net` (Jira Cloud tenant).';
+              }
+            } catch {
+              errors[BLOCK_JIRA_BASE_URL] = 'Tenant URL is not a valid URL.';
+            }
+          }
+        }
+
+        if (Object.keys(errors).length > 0) {
+          return { ok: false, errors };
+        }
+
+        // Probe + persist async (probe round-trip is too slow for the ack
+        // window). DM the result either way.
+        void (async (): Promise<void> => {
+          try {
+            const result = await userCreds.upsertJira(slackUserId, { baseUrl, email, apiToken });
+            await slackAdapter.sendMessage(slackUserId, result.replyText);
+          } catch (err) {
+            await slackAdapter.sendMessage(
+              slackUserId,
+              `Failed to save Jira credentials: ${(err as Error).message}`
             );
           }
         })();

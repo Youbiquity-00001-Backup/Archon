@@ -17,13 +17,14 @@ import {
   type AnthropicProbe,
   type GithubProbe,
   type GithubRefresh,
+  type JiraProbe,
   type UserCreds,
 } from './user-creds';
 
 describe('UserCredsService', () => {
   let usersDir: string;
   let store: InMemorySecretStore;
-  let probes: { anthropic: AnthropicProbe; github: GithubProbe };
+  let probes: { anthropic: AnthropicProbe; github: GithubProbe; jira: JiraProbe };
 
   beforeEach(async () => {
     usersDir = await mkdtemp(join(tmpdir(), 'archon-user-creds-'));
@@ -32,6 +33,7 @@ describe('UserCredsService', () => {
     probes = {
       anthropic: async () => ({ ok: true, accountEmail: 'alice@example.com' }),
       github: async () => ({ ok: true, login: 'alice' }),
+      jira: async () => ({ ok: true, status: 200 }),
     };
   });
 
@@ -41,6 +43,7 @@ describe('UserCredsService', () => {
       usersDir,
       anthropicProbe: probes.anthropic,
       githubProbe: probes.github,
+      jiraProbe: probes.jira,
     });
   }
 
@@ -218,12 +221,131 @@ describe('UserCredsService', () => {
     });
   });
 
+  describe('upsertJira', () => {
+    const goodInput = {
+      baseUrl: 'https://acme.atlassian.net',
+      email: 'alice@example.com',
+      apiToken: 'ATATT-test',
+    };
+
+    test('rejects empty fields with a per-field error', async () => {
+      const svc = newService();
+      const r1 = await svc.upsertJira('U1', { ...goodInput, baseUrl: '   ' });
+      expect(r1.persisted).toBe(false);
+      expect(r1.replyText).toMatch(/Base URL is required/);
+
+      const r2 = await svc.upsertJira('U1', { ...goodInput, email: '' });
+      expect(r2.persisted).toBe(false);
+      expect(r2.replyText).toMatch(/Email is required/);
+
+      const r3 = await svc.upsertJira('U1', { ...goodInput, apiToken: '' });
+      expect(r3.persisted).toBe(false);
+      expect(r3.replyText).toMatch(/API token is required/);
+    });
+
+    test('rejects http:// base URL', async () => {
+      const result = await newService().upsertJira('U1', {
+        ...goodInput,
+        baseUrl: 'http://acme.atlassian.net',
+      });
+      expect(result.persisted).toBe(false);
+      expect(result.replyText).toMatch(/must start with `https:\/\/`/);
+    });
+
+    test('rejects non-atlassian.net hosts', async () => {
+      const result = await newService().upsertJira('U1', {
+        ...goodInput,
+        baseUrl: 'https://jira.evil.com',
+      });
+      expect(result.persisted).toBe(false);
+      expect(result.replyText).toMatch(/atlassian\.net/);
+    });
+
+    test('rejects malformed URLs', async () => {
+      const result = await newService().upsertJira('U1', {
+        ...goodInput,
+        baseUrl: 'https://',
+      });
+      expect(result.persisted).toBe(false);
+      // Malformed URLs may bounce off either the URL parser or the host
+      // suffix check depending on platform — both are acceptable rejections.
+      expect(result.replyText).toMatch(/(not a valid URL|atlassian\.net)/);
+    });
+
+    test('strips trailing slashes from the base URL before persisting', async () => {
+      const svc = newService();
+      const result = await svc.upsertJira('U1', {
+        ...goodInput,
+        baseUrl: 'https://acme.atlassian.net///',
+      });
+      expect(result.persisted).toBe(true);
+      const stored = JSON.parse((await store.getSecret('U1')) ?? '{}');
+      expect(stored.jira?.baseUrl).toBe('https://acme.atlassian.net');
+    });
+
+    test('rejects when Jira probe returns 401', async () => {
+      probes.jira = async () => ({ ok: false, status: 401 });
+      const result = await newService().upsertJira('U1', goodInput);
+      expect(result.persisted).toBe(false);
+      expect(result.replyText).toMatch(/Jira rejected/);
+      // 401-specific hint mentioning the token rotation path.
+      expect(result.replyText).toMatch(/id\.atlassian\.com/);
+    });
+
+    test('persists creds, surfaces baseUrl + email in the reply, exposes the three env vars', async () => {
+      const svc = newService();
+      const result = await svc.upsertJira('U1', goodInput);
+      expect(result.persisted).toBe(true);
+      expect(result.replyText).toContain('https://acme.atlassian.net');
+      expect(result.replyText).toContain('alice@example.com');
+
+      const overlay = svc.getEnvOverlay('U1');
+      expect(overlay?.JIRA_BASE_URL).toBe('https://acme.atlassian.net');
+      expect(overlay?.JIRA_EMAIL).toBe('alice@example.com');
+      expect(overlay?.JIRA_API_TOKEN).toBe('ATATT-test');
+
+      // Stored doc has the apiToken (it's the one secret we keep);
+      // connection status must NOT echo it.
+      const stored = JSON.parse((await store.getSecret('U1')) ?? '{}');
+      expect(stored.jira?.apiToken).toBe('ATATT-test');
+      const status = await svc.getConnectionStatus('U1');
+      const json = JSON.stringify(status);
+      expect(json).not.toContain('ATATT-test');
+      expect(status.jira.linked).toBe(true);
+      if (status.jira.linked) {
+        expect(status.jira.baseUrl).toBe('https://acme.atlassian.net');
+        expect(status.jira.email).toBe('alice@example.com');
+      }
+    });
+
+    test('preserves existing anthropic/github sections when a Jira upsert lands on top', async () => {
+      const svc = newService();
+      await svc.upsertGithub('U1', { type: 'oauth', accessToken: 'gho_first' });
+      await svc.upsertAnthropic(
+        'U1',
+        JSON.stringify({ claudeAiOauth: { accessToken: 'sk-second' } })
+      );
+      await svc.upsertJira('U1', goodInput);
+
+      const stored = JSON.parse((await store.getSecret('U1')) ?? '{}') as UserCreds;
+      expect(stored.github?.accessToken).toBe('gho_first');
+      expect(stored.anthropic?.claudeAiOauth?.accessToken).toBe('sk-second');
+      expect(stored.jira?.email).toBe('alice@example.com');
+
+      const overlay = svc.getEnvOverlay('U1');
+      expect(overlay?.GH_TOKEN).toBe('gho_first');
+      expect(overlay?.CLAUDE_CODE_OAUTH_TOKEN).toBe('sk-second');
+      expect(overlay?.JIRA_API_TOKEN).toBe('ATATT-test');
+    });
+  });
+
   describe('getConnectionStatus', () => {
-    test('reports both kinds as not linked when no creds are stored', async () => {
+    test('reports all kinds as not linked when no creds are stored', async () => {
       const svc = newService();
       const status = await svc.getConnectionStatus('U_NONE');
       expect(status.anthropic.linked).toBe(false);
       expect(status.github.linked).toBe(false);
+      expect(status.jira.linked).toBe(false);
     });
 
     test('exposes the captured Anthropic account email but never the access token', async () => {
@@ -274,6 +396,7 @@ describe('UserCredsService', () => {
       const status = await svc.getConnectionStatus('U_CORRUPT');
       expect(status.anthropic.linked).toBe(false);
       expect(status.github.linked).toBe(false);
+      expect(status.jira.linked).toBe(false);
     });
   });
 

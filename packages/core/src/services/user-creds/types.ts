@@ -37,10 +37,28 @@ export interface GithubCreds {
   installationId?: number;
 }
 
+/**
+ * Jira Cloud API token (PAT-style). No refresh — tokens are long-lived until
+ * the user revokes them at id.atlassian.com. On 401 from Jira at use-time,
+ * we fail loud at the tool boundary; the user re-runs `/archon-creds jira`.
+ */
+export interface JiraCreds {
+  /**
+   * Tenant base URL, e.g. `https://acme.atlassian.net`. Always `https://`,
+   * always a `*.atlassian.net` host, no trailing slash. Validated on upsert.
+   */
+  baseUrl: string;
+  /** Atlassian account email used as the Basic-auth username. */
+  email: string;
+  /** API token from id.atlassian.com → Security → API tokens. */
+  apiToken: string;
+}
+
 /** The merged JSON document persisted at `<prefix>/user-creds/<slack-uid>`. */
 export interface UserCreds {
   anthropic?: AnthropicCreds;
   github?: GithubCreds;
+  jira?: JiraCreds;
 }
 
 /**
@@ -59,6 +77,9 @@ export interface UserEnvOverlay {
   HOME?: string;
   GH_TOKEN?: string;
   CLAUDE_CODE_OAUTH_TOKEN?: string;
+  JIRA_BASE_URL?: string;
+  JIRA_EMAIL?: string;
+  JIRA_API_TOKEN?: string;
 }
 
 /** Result of an `upsertForUser` call. */
@@ -91,5 +112,14 @@ export interface ConnectionStatus {
         login: string;
         /** Optional GitHub App installation id, when captured. */
         installationId?: number;
+      };
+  jira:
+    | { linked: false }
+    | {
+        linked: true;
+        /** Tenant base URL (e.g. `https://acme.atlassian.net`). */
+        baseUrl: string;
+        /** Atlassian account email captured at upsert time. */
+        email: string;
       };
 }
