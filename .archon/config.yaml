@@ -3,3 +3,10 @@ worktree:
 
 docs:
   path: packages/docs-web/src/content/docs
+
+# Global MCP servers — merged into every Claude SDK call. Each path points
+# to a JSON file with the same shape as per-node mcp: configs. Servers gate
+# their own spawn via requireEnv on each server block; users without the
+# required env vars (e.g. JIRA_*) silently skip the spawn.
+globalMcp:
+  - .archon/mcp/jira.json

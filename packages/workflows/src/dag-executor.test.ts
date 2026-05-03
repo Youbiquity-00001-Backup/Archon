@@ -2238,6 +2238,19 @@ describe('loadMcpConfig', () => {
     expect(result.missingVars).toEqual([]);
   });
 
+  it('unwraps the { mcpServers: { ... } } envelope used by Claude Code settings', async () => {
+    const config = {
+      mcpServers: {
+        github: { command: 'npx', args: ['-y', '@mcp/server-github'] },
+      },
+    };
+    await writeFile(join(testDir, 'wrapped.json'), JSON.stringify(config));
+
+    const result = await loadMcpConfig('wrapped.json', testDir);
+    expect(result.serverNames).toEqual(['github']);
+    expect(result.servers).toEqual(config.mcpServers);
+  });
+
   it('loads multiple servers from one config', async () => {
     const config = {
       github: { command: 'npx', args: ['-y', '@mcp/server-github'] },

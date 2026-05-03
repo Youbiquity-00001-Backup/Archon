@@ -356,6 +356,79 @@ curl -d "Hello from Archon" ntfy.sh/YOUR_TOPIC_NAME
 bun run cli workflow run archon-smart-pr-review "Review PR #123"
 ```
 
+## Global MCPs (every Claude call)
+
+Per-node `mcp:` is the right primitive for tools a single workflow needs.
+For tools the operator wants on **every** Claude call (cross-cutting
+integrations like Jira, internal docs, a secrets vault), declare them at
+config level via `globalMcp`:
+
+```yaml
+# .archon/config.yaml — repo-scoped
+globalMcp:
+  - .archon/mcp/jira.json
+```
+
+```yaml
+# ~/.archon/config.yaml — user-scoped, applies to every project
+globalMcp:
+  - /opt/archon/mcp/internal-docs.json
+```
+
+Each entry is a path (relative to the cwd at call time, or absolute) to
+an MCP config JSON file in the same shape per-node `mcp:` accepts. The
+Claude provider reads the merged list once per call and merges each
+file's servers into the per-node `mcpServers` map.
+
+**Per-node servers win on name conflict.** Re-declaring a server name
+inside a node lets you override a global server for that specific node.
+
+### `requireEnv`: gating the spawn on env-var presence
+
+A global server typically depends on per-user credentials that not every
+caller has. Skipping the spawn (rather than failing inside the SDK on
+the first tool call) keeps the tool surface clean for unlinked users:
+
+```json
+{
+  "mcpServers": {
+    "atlassian": {
+      "command": "uvx",
+      "args": ["mcp-atlassian", "--enabled-tools", "jira"],
+      "env": {
+        "JIRA_URL": "${JIRA_BASE_URL}",
+        "JIRA_USERNAME": "${JIRA_EMAIL}",
+        "JIRA_API_TOKEN": "${JIRA_API_TOKEN}"
+      },
+      "requireEnv": ["JIRA_BASE_URL", "JIRA_EMAIL", "JIRA_API_TOKEN"]
+    }
+  }
+}
+```
+
+When any var listed in `requireEnv` is missing or empty, the server is
+silently skipped (debug log: `claude.mcp_global_skipped_missing_env`).
+Without `requireEnv`, Archon falls back to "every `${VAR}` referenced
+in `env`/`headers` must be set" as the gating rule.
+
+### Tools-disabled (routing) calls skip the merge
+
+When a call sets `nodeConfig.allowed_tools: []` (the "no tools" idiom
+used by routing-style calls and `title-generator`), the global-MCP
+merge is skipped entirely — there's no point paying uvx cold-start
+latency when no tools are exposed.
+
+### File-shape envelopes
+
+`loadMcpConfig` accepts both shapes:
+
+- **Flat** — `{ "<server-name>": { ... } }` (the existing per-node convention)
+- **Envelope** — `{ "mcpServers": { "<server-name>": { ... } } }` (Claude
+  Code's own settings file shape)
+
+This lets you copy/paste a server block from a hand-edited
+`~/.claude/settings.json` straight into a global MCP file.
+
 ## MCP vs allowed_tools/denied_tools vs hooks
 
 | Feature | `mcp` | `allowed_tools`/`denied_tools` | `hooks` |

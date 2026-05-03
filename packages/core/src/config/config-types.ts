@@ -132,6 +132,16 @@ export interface GlobalConfig {
      */
     maxConversations?: number;
   };
+
+  /**
+   * Global-scope MCP server config files (paths relative to the repo's cwd at
+   * call time, or absolute). Merged on top of `RepoConfig.globalMcp` — repo
+   * entries are appended after global entries. Useful for operator-managed
+   * MCPs that should be available across every project on a deployment.
+   *
+   * See `RepoConfig.globalMcp` for the file-shape contract.
+   */
+  globalMcp?: string[];
 }
 
 /**
@@ -264,6 +274,28 @@ export interface RepoConfig {
      */
     loadDefaultWorkflows?: boolean;
   };
+
+  /**
+   * Paths (relative to repo root, or absolute) of MCP server config JSON
+   * files that should be merged into every Claude SDK call — both per-node
+   * workflow calls and one-off orchestrator calls.
+   *
+   * Each file uses the same shape that per-node `mcp:` already accepts
+   * (`{ "mcpServers": { ... } }`). Servers are merged after per-node MCPs;
+   * per-node servers win on name conflicts.
+   *
+   * Each server block may declare a `requireEnv: string[]` field listing
+   * env vars that must be present before the server is included. When any
+   * of those env vars is missing, the server is silently skipped (logged at
+   * debug). This gates the spawn on per-user creds — users without the
+   * required env vars do not pay the spawn cost or see auth-failure tools.
+   *
+   * Currently only the Claude provider consumes this. Codex and Pi do not
+   * use the same `mcpServers` pathway.
+   *
+   * @example ['.archon/mcp/jira.json']
+   */
+  globalMcp?: string[];
 }
 
 /**
@@ -332,6 +364,18 @@ export interface MergedConfig {
    * read-only from a secret store, never committed.
    */
   userEnvVars?: Record<string, Record<string, string>>;
+
+  /**
+   * Merged list of MCP server config files to spawn on every Claude SDK call.
+   * Sourced from `RepoConfig.globalMcp` (and `GlobalConfig.globalMcp` when
+   * added). Plumbed through `SendQueryOptions.globalMcp` to the Claude
+   * provider, which loads the files via `loadMcpConfig`, gates each server on
+   * `requireEnv`, and merges into the per-node `mcpServers` map (per-node
+   * wins on name conflicts).
+   *
+   * See `RepoConfig.globalMcp` for the file-shape contract.
+   */
+  globalMcp?: string[];
 }
 
 /**

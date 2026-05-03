@@ -31,8 +31,12 @@ pnpm-lock.yaml
 .env
 .env.local
 
-# Per-user MCP server configs (may contain secrets/topics)
-.archon/mcp/
+# Per-user MCP server configs (may contain secrets/topics).
+# Listed as a glob (not a directory) so negations below can re-include
+# specific files. Operator-managed global MCPs that reference creds via
+# ${VAR} only are safe to commit and are re-included by name.
+.archon/mcp/*
+!.archon/mcp/jira.json
 
 # Caddy configuration (keep Caddyfile.example)
 Caddyfile

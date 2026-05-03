@@ -224,6 +224,13 @@ export interface SendQueryOptions extends AgentRequestOptions {
   nodeConfig?: NodeConfig;
   /** Per-provider defaults from .archon/config.yaml assistants section. */
   assistantConfig?: Record<string, unknown>;
+  /**
+   * Paths (relative to cwd or absolute) of MCP server config JSON files to
+   * merge into every supported provider's call. Sourced from `MergedConfig.globalMcp`.
+   * Per-node `nodeConfig.mcp` servers win on name conflicts. Currently only
+   * the Claude provider consumes this; other providers ignore the field.
+   */
+  globalMcp?: string[];
 }
 
 /**

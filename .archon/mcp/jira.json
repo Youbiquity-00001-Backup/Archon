@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "atlassian": {
+      "command": "uvx",
+      "args": [
+        "mcp-atlassian",
+        "--toolsets",
+        "jira_issues,jira_projects,jira_agile,jira_fields,jira_comments,jira_transitions,jira_links,jira_worklog,jira_attachments,jira_users,jira_watchers,jira_service_desk,jira_forms,jira_metrics,jira_development"
+      ],
+      "env": {
+        "JIRA_URL": "${JIRA_BASE_URL}",
+        "JIRA_USERNAME": "${JIRA_EMAIL}",
+        "JIRA_API_TOKEN": "${JIRA_API_TOKEN}"
+      },
+      "requireEnv": ["JIRA_BASE_URL", "JIRA_EMAIL", "JIRA_API_TOKEN"]
+    }
+  }
+}

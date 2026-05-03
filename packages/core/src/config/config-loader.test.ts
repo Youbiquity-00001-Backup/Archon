@@ -371,6 +371,41 @@ streaming:
       expect(config.userEnvVars).toBeUndefined();
     });
 
+    test('propagates globalMcp paths and appends repo entries after global', async () => {
+      const pathMatches = (path: string, pattern: string): boolean => {
+        const normalizedPath = path.replace(/\\/g, '/');
+        return normalizedPath.includes(pattern);
+      };
+
+      let globalConfigRead = false;
+      mockReadConfigFile.mockImplementation(async (path: string) => {
+        if (pathMatches(path, '/repo/.archon/config.yaml')) {
+          return ['globalMcp:', '  - .archon/mcp/jira.json'].join('\n');
+        }
+        if (pathMatches(path, '.archon/config.yaml') && !globalConfigRead) {
+          globalConfigRead = true;
+          return ['globalMcp:', '  - /shared/mcp/internal.json'].join('\n');
+        }
+        const error = new Error('ENOENT') as NodeJS.ErrnoException;
+        error.code = 'ENOENT';
+        throw error;
+      });
+
+      const config = await loadConfig('/test/repo');
+      expect(config.globalMcp).toEqual(['/shared/mcp/internal.json', '.archon/mcp/jira.json']);
+    });
+
+    test('globalMcp is undefined when not configured', async () => {
+      mockReadConfigFile.mockImplementation(async () => {
+        const error = new Error('ENOENT') as NodeJS.ErrnoException;
+        error.code = 'ENOENT';
+        throw error;
+      });
+
+      const config = await loadConfig();
+      expect(config.globalMcp).toBeUndefined();
+    });
+
     test('propagates baseBranch from repo worktree config', async () => {
       const pathMatches = (path: string, pattern: string): boolean => {
         const normalizedPath = path.replace(/\\/g, '/');

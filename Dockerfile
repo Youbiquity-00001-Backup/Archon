@@ -108,6 +108,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
 # Point agent-browser to system Chromium (avoids ~400MB Chrome for Testing download)
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 
+# uv: Python toolchain runner used by MCP servers (mcp-atlassian, etc.)
+# Pre-warm mcp-atlassian into a system-wide uv tool cache so the first per-user
+# spawn doesn't pay the resolve+download (~5s saved per worker cold-start) and
+# every user shares one venv. Unpinned — image rebuilds pick up the latest
+# release; treat the layer SHA as the version handle.
+ENV UV_TOOL_DIR=/usr/local/share/uv/tools \
+    UV_TOOL_BIN_DIR=/usr/local/bin
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh \
+    && mkdir -p "$UV_TOOL_DIR" \
+    && uv tool install mcp-atlassian \
+    && chmod -R a+rX "$UV_TOOL_DIR"
+
 # Pre-configure the Claude Code SDK cli.js path for any consumer that runs
 # a compiled Archon binary inside (or extending) this image. In source mode
 # (the default `bun run start` ENTRYPOINT), BUNDLED_IS_BINARY is false and

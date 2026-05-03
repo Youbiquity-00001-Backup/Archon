@@ -410,6 +410,13 @@ function mergeGlobalConfig(defaults: MergedConfig, global: GlobalConfig): Merged
     result.userEnvVars = global.userEnvVars;
   }
 
+  // Global-scope MCP config files. Repo entries are appended later in
+  // mergeRepoConfig — order matters because per-node MCPs already win
+  // on name conflict; among global entries, last-listed wins.
+  if (global.globalMcp && global.globalMcp.length > 0) {
+    result.globalMcp = [...global.globalMcp];
+  }
+
   return result;
 }
 
@@ -474,6 +481,11 @@ function mergeRepoConfig(merged: MergedConfig, repo: RepoConfig): MergedConfig {
   // Propagate per-project env vars from repo config
   if (repo.env) {
     result.envVars = { ...result.envVars, ...repo.env };
+  }
+
+  // Append repo-level global MCP files after any global-config entries.
+  if (repo.globalMcp && repo.globalMcp.length > 0) {
+    result.globalMcp = [...(result.globalMcp ?? []), ...repo.globalMcp];
   }
 
   return result;

@@ -75,6 +75,12 @@ export interface WorkflowConfig {
   baseBranch?: string;
   docsPath?: string;
   envVars?: Record<string, string>;
+  /**
+   * Paths of MCP server config JSON files to merge into every Claude SDK call.
+   * Sourced from `MergedConfig.globalMcp` (`.archon/config.yaml#globalMcp`).
+   * Per-node `mcp:` servers win on name conflicts. Other providers ignore.
+   */
+  globalMcp?: string[];
   commands: { folder?: string };
   defaults?: {
     loadDefaultWorkflows?: boolean;

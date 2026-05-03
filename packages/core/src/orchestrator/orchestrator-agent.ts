@@ -896,6 +896,7 @@ export async function handleMessage(
     const requestOptions: SendQueryOptions = {
       assistantConfig: config.assistants[providerKey] ?? {},
       env: Object.keys(effectiveEnv).length > 0 ? effectiveEnv : undefined,
+      ...(config.globalMcp && config.globalMcp.length > 0 ? { globalMcp: config.globalMcp } : {}),
     };
 
     const mode = platform.getStreamingMode();

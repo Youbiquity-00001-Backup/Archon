@@ -466,6 +466,7 @@ async function resolveNodeProviderAndModel(
     ...baseOptions,
     nodeConfig,
     assistantConfig,
+    ...(config.globalMcp && config.globalMcp.length > 0 ? { globalMcp: config.globalMcp } : {}),
   };
 
   return { provider, model, options };
@@ -1698,6 +1699,9 @@ function buildLoopNodeOptions(
     options.env = config.envVars;
   }
   options.assistantConfig = config.assistants[provider] ?? {};
+  if (config.globalMcp && config.globalMcp.length > 0) {
+    options.globalMcp = config.globalMcp;
+  }
   // Pass workflow-level options as nodeConfig so providers can apply them
   if (workflowLevelOptions) {
     options.nodeConfig = {

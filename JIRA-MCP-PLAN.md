@@ -192,24 +192,35 @@ on each cold start. Recommend pre-warm for deploy stability.
   "mcpServers": {
     "atlassian": {
       "command": "uvx",
-      "args": ["mcp-atlassian", "--enabled-tools", "jira"],
+      "args": [
+        "mcp-atlassian",
+        "--toolsets",
+        "jira_issues,jira_projects,jira_agile,jira_fields,jira_comments,jira_transitions,jira_links,jira_worklog,jira_attachments,jira_users,jira_watchers,jira_service_desk,jira_forms,jira_metrics,jira_development"
+      ],
       "env": {
         "JIRA_URL": "${JIRA_BASE_URL}",
         "JIRA_USERNAME": "${JIRA_EMAIL}",
         "JIRA_API_TOKEN": "${JIRA_API_TOKEN}"
-      }
+      },
+      "requireEnv": ["JIRA_BASE_URL", "JIRA_EMAIL", "JIRA_API_TOKEN"]
     }
   }
 }
 ```
 
-Note the env-var rename — Archon emits `JIRA_BASE_URL`/`JIRA_EMAIL`,
-`mcp-atlassian` wants `JIRA_URL`/`JIRA_USERNAME`. The `${VAR}` substitution
-in `loadMcpConfig` bridges them at execution time
-(`packages/providers/src/claude/provider.ts:262`).
+Notes (verified against `mcp-atlassian` 0.21.x):
 
-Confirm the exact `--enabled-tools` flag in current `mcp-atlassian`
-docs before shipping — flag name has changed across versions.
+- **Env-var rename**: Archon emits `JIRA_BASE_URL`/`JIRA_EMAIL`,
+  `mcp-atlassian` wants `JIRA_URL`/`JIRA_USERNAME`. The `${VAR}`
+  substitution in `loadMcpConfig` bridges them at execution time
+  (`packages/providers/src/claude/provider.ts`).
+- **Toolset enumeration**: `--toolsets` requires individual toolset names;
+  there is no `jira` umbrella value and no `--enabled-tools` flag in
+  current versions. Listing all 15 Jira toolsets and omitting Confluence
+  toolsets keeps Confluence tools out of the surface entirely (rather
+  than letting them spawn and fail at first call).
+- **`requireEnv`**: gates the spawn on per-user creds. Users without
+  linked Jira creds silently skip — see Patch 3 in `PATCH-PLAN.md`.
 
 ### Step 3 — Config schema: `globalMcp`
 

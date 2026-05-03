@@ -1,4 +1,7 @@
-import { describe, test, expect, mock, beforeEach, spyOn } from 'bun:test';
+import { describe, test, expect, mock, beforeEach, afterEach, spyOn } from 'bun:test';
+import { mkdir, rm, writeFile } from 'fs/promises';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { createMockLogger } from '../test/mocks/logger';
 
 const mockLogger = createMockLogger();
@@ -1341,5 +1344,371 @@ describe('sendQuery decomposition behaviors', () => {
       );
       expect(warnCalls).toHaveLength(0);
     });
+  });
+});
+
+// ─── globalMcp merge ──────────────────────────────────────────────────────
+
+describe('globalMcp merge (sendQuery)', () => {
+  let client: ClaudeProvider;
+  let testDir: string;
+  // Captured env vars to restore between tests
+  const envBackup = new Map<string, string | undefined>();
+
+  function setEnv(key: string, value: string | undefined): void {
+    if (!envBackup.has(key)) {
+      envBackup.set(key, process.env[key]);
+    }
+    if (value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
+
+  beforeEach(async () => {
+    client = new ClaudeProvider({ retryBaseDelayMs: 1 });
+    mockQuery.mockClear();
+    mockLogger.info.mockClear();
+    mockLogger.warn.mockClear();
+    mockLogger.error.mockClear();
+    mockLogger.debug.mockClear();
+    testDir = join(
+      tmpdir(),
+      `claude-globalmcp-test-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    await mkdir(testDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    await rm(testDir, { recursive: true, force: true });
+    for (const [key, value] of envBackup) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+    envBackup.clear();
+  });
+
+  test('loads global MCP file and merges into options.mcpServers', async () => {
+    setEnv('JIRA_BASE_URL', 'https://example.atlassian.net');
+    setEnv('JIRA_EMAIL', 'me@example.com');
+    setEnv('JIRA_API_TOKEN', 'token-abc');
+
+    const config = {
+      mcpServers: {
+        atlassian: {
+          command: 'uvx',
+          args: ['mcp-atlassian'],
+          env: {
+            JIRA_URL: '$JIRA_BASE_URL',
+            JIRA_USERNAME: '$JIRA_EMAIL',
+            JIRA_API_TOKEN: '$JIRA_API_TOKEN',
+          },
+          requireEnv: ['JIRA_BASE_URL', 'JIRA_EMAIL', 'JIRA_API_TOKEN'],
+        },
+      },
+    };
+    await writeFile(join(testDir, 'jira.json'), JSON.stringify(config));
+
+    mockQuery.mockImplementation(async function* () {
+      yield { type: 'result', session_id: 'sid' };
+    });
+
+    for await (const _ of client.sendQuery('test', testDir, undefined, {
+      globalMcp: ['jira.json'],
+    })) {
+      // consume
+    }
+
+    const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+    const mcpServers = callArgs.options.mcpServers as Record<string, Record<string, unknown>>;
+    expect(Object.keys(mcpServers)).toEqual(['atlassian']);
+    expect(mcpServers.atlassian.command).toBe('uvx');
+    expect(mcpServers.atlassian.env).toEqual({
+      JIRA_URL: 'https://example.atlassian.net',
+      JIRA_USERNAME: 'me@example.com',
+      JIRA_API_TOKEN: 'token-abc',
+    });
+    // requireEnv is an Archon gating signal, not part of the SDK schema —
+    // it must be stripped before reaching the SDK.
+    expect('requireEnv' in mcpServers.atlassian).toBe(false);
+    // mcp__<server>__* wildcards added so the SDK exposes the MCP tools.
+    expect(callArgs.options.allowedTools).toContain('mcp__atlassian__*');
+  });
+
+  test('skips a global MCP server when requireEnv vars are missing', async () => {
+    setEnv('JIRA_BASE_URL', undefined);
+    setEnv('JIRA_EMAIL', undefined);
+    setEnv('JIRA_API_TOKEN', undefined);
+
+    const config = {
+      mcpServers: {
+        atlassian: {
+          command: 'uvx',
+          env: { JIRA_URL: '$JIRA_BASE_URL' },
+          requireEnv: ['JIRA_BASE_URL', 'JIRA_EMAIL', 'JIRA_API_TOKEN'],
+        },
+      },
+    };
+    await writeFile(join(testDir, 'jira.json'), JSON.stringify(config));
+
+    mockQuery.mockImplementation(async function* () {
+      yield { type: 'result', session_id: 'sid' };
+    });
+
+    for await (const _ of client.sendQuery('test', testDir, undefined, {
+      globalMcp: ['jira.json'],
+    })) {
+      // consume
+    }
+
+    const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+    expect(callArgs.options.mcpServers).toBeUndefined();
+    expect(mockLogger.debug).toHaveBeenCalledWith(
+      expect.objectContaining({ serverName: 'atlassian' }),
+      'claude.mcp_global_skipped_missing_env'
+    );
+  });
+
+  test('per-node MCP server wins on name conflict with global MCP', async () => {
+    setEnv('JIRA_BASE_URL', 'https://example.atlassian.net');
+    setEnv('JIRA_EMAIL', 'me@example.com');
+    setEnv('JIRA_API_TOKEN', 'token-abc');
+
+    const globalConfig = {
+      mcpServers: {
+        atlassian: {
+          command: 'uvx',
+          args: ['from-global'],
+          env: { JIRA_URL: '$JIRA_BASE_URL' },
+          requireEnv: ['JIRA_BASE_URL', 'JIRA_EMAIL', 'JIRA_API_TOKEN'],
+        },
+      },
+    };
+    await writeFile(join(testDir, 'global.json'), JSON.stringify(globalConfig));
+
+    // Per-node config uses the flat shape (the existing convention) and
+    // re-uses the same server name to override.
+    const nodeConfig = {
+      atlassian: { command: 'echo', args: ['from-node'] },
+    };
+    await writeFile(join(testDir, 'node.json'), JSON.stringify(nodeConfig));
+
+    mockQuery.mockImplementation(async function* () {
+      yield { type: 'result', session_id: 'sid' };
+    });
+
+    for await (const _ of client.sendQuery('test', testDir, undefined, {
+      globalMcp: ['global.json'],
+      nodeConfig: { mcp: 'node.json' },
+    })) {
+      // consume
+    }
+
+    const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+    const mcpServers = callArgs.options.mcpServers as Record<string, Record<string, unknown>>;
+    expect(Object.keys(mcpServers)).toEqual(['atlassian']);
+    expect(mcpServers.atlassian.args).toEqual(['from-node']);
+    expect(mockLogger.debug).toHaveBeenCalledWith(
+      expect.objectContaining({ serverName: 'atlassian' }),
+      'claude.mcp_global_skipped_per_node_override'
+    );
+  });
+
+  test('skips all global MCPs when nodeConfig.allowed_tools is [] (routing-style call)', async () => {
+    setEnv('JIRA_BASE_URL', 'https://example.atlassian.net');
+    setEnv('JIRA_EMAIL', 'me@example.com');
+    setEnv('JIRA_API_TOKEN', 'token-abc');
+
+    const config = {
+      mcpServers: {
+        atlassian: {
+          command: 'uvx',
+          requireEnv: ['JIRA_BASE_URL', 'JIRA_EMAIL', 'JIRA_API_TOKEN'],
+        },
+      },
+    };
+    await writeFile(join(testDir, 'jira.json'), JSON.stringify(config));
+
+    mockQuery.mockImplementation(async function* () {
+      yield { type: 'result', session_id: 'sid' };
+    });
+
+    for await (const _ of client.sendQuery('test', testDir, undefined, {
+      globalMcp: ['jira.json'],
+      nodeConfig: { allowed_tools: [] },
+    })) {
+      // consume
+    }
+
+    const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+    expect(callArgs.options.mcpServers).toBeUndefined();
+    expect(mockLogger.debug).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: 'tools_disabled' }),
+      'claude.mcp_global_skipped_tools_disabled'
+    );
+  });
+
+  test('falls back to ${VAR}-resolved gating when requireEnv is absent', async () => {
+    setEnv('PRESENT_VAR_GLOBAL_MCP', 'value');
+    setEnv('MISSING_VAR_GLOBAL_MCP', undefined);
+
+    const config = {
+      mcpServers: {
+        ok: {
+          command: 'echo',
+          env: { K: '$PRESENT_VAR_GLOBAL_MCP' },
+        },
+        broken: {
+          command: 'echo',
+          env: { K: '$MISSING_VAR_GLOBAL_MCP' },
+        },
+      },
+    };
+    await writeFile(join(testDir, 'global.json'), JSON.stringify(config));
+
+    mockQuery.mockImplementation(async function* () {
+      yield { type: 'result', session_id: 'sid' };
+    });
+
+    for await (const _ of client.sendQuery('test', testDir, undefined, {
+      globalMcp: ['global.json'],
+    })) {
+      // consume
+    }
+
+    const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+    const mcpServers = callArgs.options.mcpServers as Record<string, Record<string, unknown>>;
+    expect(Object.keys(mcpServers)).toEqual(['ok']);
+    expect(mockLogger.debug).toHaveBeenCalledWith(
+      expect.objectContaining({ serverName: 'broken' }),
+      'claude.mcp_global_skipped_missing_env'
+    );
+  });
+
+  test('continues loading remaining files when one global MCP file fails to load', async () => {
+    setEnv('FOO_GLOBAL_MCP', 'foo');
+
+    const goodConfig = {
+      mcpServers: { foo: { command: 'echo', env: { K: '$FOO_GLOBAL_MCP' } } },
+    };
+    await writeFile(join(testDir, 'good.json'), JSON.stringify(goodConfig));
+
+    mockQuery.mockImplementation(async function* () {
+      yield { type: 'result', session_id: 'sid' };
+    });
+
+    for await (const _ of client.sendQuery('test', testDir, undefined, {
+      globalMcp: ['missing.json', 'good.json'],
+    })) {
+      // consume
+    }
+
+    const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+    const mcpServers = callArgs.options.mcpServers as Record<string, Record<string, unknown>>;
+    expect(Object.keys(mcpServers)).toEqual(['foo']);
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ path: 'missing.json' }),
+      'claude.mcp_global_load_failed'
+    );
+  });
+
+  test('no-op when globalMcp is empty', async () => {
+    mockQuery.mockImplementation(async function* () {
+      yield { type: 'result', session_id: 'sid' };
+    });
+
+    for await (const _ of client.sendQuery('test', testDir, undefined, {
+      globalMcp: [],
+    })) {
+      // consume
+    }
+
+    const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+    expect(callArgs.options.mcpServers).toBeUndefined();
+  });
+
+  test('uses requestOptions.env (per-user overlay) for substitution and requireEnv gate', async () => {
+    // Regression: the user_env_vars patch threads per-user creds through
+    // requestOptions.env only — they are NOT in process.env. Gating against
+    // process.env alone would skip every server in a multi-tenant deploy.
+    setEnv('JIRA_BASE_URL', undefined);
+    setEnv('JIRA_EMAIL', undefined);
+    setEnv('JIRA_API_TOKEN', undefined);
+
+    const config = {
+      mcpServers: {
+        atlassian: {
+          command: 'uvx',
+          env: {
+            JIRA_URL: '$JIRA_BASE_URL',
+            JIRA_USERNAME: '$JIRA_EMAIL',
+            JIRA_API_TOKEN: '$JIRA_API_TOKEN',
+          },
+          requireEnv: ['JIRA_BASE_URL', 'JIRA_EMAIL', 'JIRA_API_TOKEN'],
+        },
+      },
+    };
+    await writeFile(join(testDir, 'jira.json'), JSON.stringify(config));
+
+    mockQuery.mockImplementation(async function* () {
+      yield { type: 'result', session_id: 'sid' };
+    });
+
+    for await (const _ of client.sendQuery('test', testDir, undefined, {
+      globalMcp: ['jira.json'],
+      // Per-user overlay only — process.env is intentionally empty above.
+      env: {
+        JIRA_BASE_URL: 'https://userB.atlassian.net',
+        JIRA_EMAIL: 'userB@example.com',
+        JIRA_API_TOKEN: 'userB-token',
+      },
+    })) {
+      // consume
+    }
+
+    const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+    const mcpServers = callArgs.options.mcpServers as Record<string, Record<string, unknown>>;
+    expect(Object.keys(mcpServers)).toEqual(['atlassian']);
+    expect(mcpServers.atlassian.env).toEqual({
+      JIRA_URL: 'https://userB.atlassian.net',
+      JIRA_USERNAME: 'userB@example.com',
+      JIRA_API_TOKEN: 'userB-token',
+    });
+  });
+
+  test('treats empty-string env values as missing (gate skips the server)', async () => {
+    // Defense in depth: if a per-user overlay is present but a credential
+    // is blank (key created but never populated), treat as missing rather
+    // than passing through an empty string the MCP would 401 on.
+    setEnv('JIRA_BASE_URL', '');
+    setEnv('JIRA_EMAIL', '');
+    setEnv('JIRA_API_TOKEN', '');
+
+    const config = {
+      mcpServers: {
+        atlassian: {
+          command: 'uvx',
+          requireEnv: ['JIRA_BASE_URL', 'JIRA_EMAIL', 'JIRA_API_TOKEN'],
+        },
+      },
+    };
+    await writeFile(join(testDir, 'jira.json'), JSON.stringify(config));
+
+    mockQuery.mockImplementation(async function* () {
+      yield { type: 'result', session_id: 'sid' };
+    });
+
+    for await (const _ of client.sendQuery('test', testDir, undefined, {
+      globalMcp: ['jira.json'],
+    })) {
+      // consume
+    }
+
+    const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+    expect(callArgs.options.mcpServers).toBeUndefined();
   });
 });

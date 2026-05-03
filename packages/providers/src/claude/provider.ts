@@ -206,11 +206,33 @@ export function getProcessUid(): number | undefined {
 // ─── MCP Config Loading (absorbed from dag-executor) ───────────────────────
 
 /**
- * Expand $VAR_NAME references in string-valued records from process.env.
+ * Env-var lookup source for `${VAR}` substitution and `requireEnv` gating.
+ *
+ * The per-node MCP path uses `process.env`; the global-MCP path uses the
+ * SDK call's effective env (process.env merged with `requestOptions.env`)
+ * so per-user overlays from the user_env_vars patch — typically
+ * `JIRA_BASE_URL`/`JIRA_EMAIL`/`JIRA_API_TOKEN` injected from
+ * `userCreds.getEnvOverlay()` — are visible to the gate. Without this,
+ * gating would silently skip every MCP server in a multi-tenant deploy.
+ *
+ * Treats empty strings the same as undefined: an empty value is "missing"
+ * for the gate's purpose. A blank credential should not appear available.
+ */
+type EnvSource = Record<string, string | undefined>;
+
+function lookupEnv(env: EnvSource, name: string): string | undefined {
+  const val = env[name];
+  return val === undefined || val === '' ? undefined : val;
+}
+
+/**
+ * Expand $VAR_NAME references in string-valued records from `env`
+ * (defaults to `process.env`).
  */
 function expandEnvVarsInRecord(
   record: Record<string, unknown>,
-  missingVars: string[]
+  missingVars: string[],
+  env: EnvSource = process.env
 ): Record<string, string> {
   const result: Record<string, string> = {};
   for (const [key, val] of Object.entries(record)) {
@@ -220,49 +242,85 @@ function expandEnvVarsInRecord(
       continue;
     }
     result[key] = val.replace(/\$([A-Z_][A-Z0-9_]*)/g, (_, varName: string) => {
-      const envVal = process.env[varName];
+      const envVal = lookupEnv(env, varName);
       if (envVal === undefined) {
         missingVars.push(varName);
+        return '';
       }
-      return envVal ?? '';
+      return envVal;
     });
   }
   return result;
 }
 
-function expandEnvVars(config: Record<string, unknown>): {
+function expandEnvVars(
+  config: Record<string, unknown>,
+  env: EnvSource = process.env
+): {
   expanded: Record<string, unknown>;
   missingVars: string[];
+  /**
+   * Per-server `${VAR}` references that resolved to undefined. Keys are
+   * server names; values are deduped lists of missing var names. Servers
+   * with no missing vars do not appear. Used by the global-MCP merge to
+   * decide which servers to gate out — aggregate `missingVars` is too
+   * coarse since it cannot attribute a missing var to one server vs
+   * another.
+   */
+  perServerMissingVars: Map<string, string[]>;
 } {
   const result: Record<string, unknown> = {};
   const missingVars: string[] = [];
+  const perServerMissingVars = new Map<string, string[]>();
   for (const [serverName, serverConfig] of Object.entries(config)) {
     if (typeof serverConfig !== 'object' || serverConfig === null) {
       getLog().warn({ serverName, valueType: typeof serverConfig }, 'mcp_server_config_not_object');
       continue;
     }
     const server = { ...(serverConfig as Record<string, unknown>) };
+    const serverMissing: string[] = [];
     if (server.env && typeof server.env === 'object') {
-      server.env = expandEnvVarsInRecord(server.env as Record<string, unknown>, missingVars);
+      server.env = expandEnvVarsInRecord(server.env as Record<string, unknown>, serverMissing, env);
     }
     if (server.headers && typeof server.headers === 'object') {
       server.headers = expandEnvVarsInRecord(
         server.headers as Record<string, unknown>,
-        missingVars
+        serverMissing,
+        env
       );
+    }
+    if (serverMissing.length > 0) {
+      perServerMissingVars.set(serverName, [...new Set(serverMissing)]);
+      missingVars.push(...serverMissing);
     }
     result[serverName] = server;
   }
-  return { expanded: result, missingVars };
+  return { expanded: result, missingVars, perServerMissingVars };
 }
 
 /**
  * Load MCP server config from a JSON file and expand environment variables.
+ *
+ * Files may use either of two top-level shapes:
+ *   - Flat:  `{ "<server-name>": { ...config } }`
+ *   - Nested: `{ "mcpServers": { "<server-name>": { ...config } } }`
+ *
+ * The nested form is the same shape Claude Code's settings file uses, which
+ * makes copy/paste between Archon and a hand-edited `~/.claude/settings.json`
+ * frictionless. Both forms are accepted; the nested form is unwrapped before
+ * env-var expansion.
  */
 export async function loadMcpConfig(
   mcpPath: string,
-  cwd: string
-): Promise<{ servers: Record<string, unknown>; serverNames: string[]; missingVars: string[] }> {
+  cwd: string,
+  env: EnvSource = process.env
+): Promise<{
+  servers: Record<string, unknown>;
+  serverNames: string[];
+  missingVars: string[];
+  /** Per-server missing-var attribution. See `expandEnvVars` for the contract. */
+  perServerMissingVars: Map<string, string[]>;
+}> {
   const fullPath = isAbsolute(mcpPath) ? mcpPath : resolve(cwd, mcpPath);
 
   let raw: string;
@@ -288,9 +346,173 @@ export async function loadMcpConfig(
     throw new Error(`MCP config must be a JSON object (Record<string, ServerConfig>): ${mcpPath}`);
   }
 
-  const { expanded, missingVars } = expandEnvVars(parsed);
+  // Accept the `{ mcpServers: { ... } }` envelope used by Claude Code's
+  // settings file. If `mcpServers` is the only top-level key (or the only
+  // object-typed top-level key), unwrap it. This preserves backwards
+  // compatibility with the flat shape per-node configs already use.
+  const mcpServersField = (parsed as { mcpServers?: unknown }).mcpServers;
+  if (mcpServersField && typeof mcpServersField === 'object' && !Array.isArray(mcpServersField)) {
+    parsed = mcpServersField as Record<string, unknown>;
+  }
+
+  const { expanded, missingVars, perServerMissingVars } = expandEnvVars(parsed, env);
   const serverNames = Object.keys(expanded);
-  return { servers: expanded, serverNames, missingVars };
+  return { servers: expanded, serverNames, missingVars, perServerMissingVars };
+}
+
+// ─── Global MCP Merge ──────────────────────────────────────────────────────
+
+/**
+ * Strip the `requireEnv` field from a server config block — it's an Archon
+ * gating signal, not part of the upstream MCP server schema, and the SDK
+ * rejects unknown keys.
+ */
+function stripRequireEnv(server: Record<string, unknown>): Record<string, unknown> {
+  if (!('requireEnv' in server)) return server;
+  const cleaned: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(server)) {
+    if (k === 'requireEnv') continue;
+    cleaned[k] = v;
+  }
+  return cleaned;
+}
+
+/**
+ * Decide whether a global MCP server should be included for the current
+ * Claude call.
+ *
+ * Gating rules (any one missing → skip):
+ *   1. Each var in the server's optional `requireEnv: string[]` must be set
+ *      (and non-empty) in `env`.
+ *   2. If `requireEnv` is absent, fall back to "every `${VAR}` referenced in
+ *      env/headers is set" — i.e. `expandEnvVars` reported no missing vars
+ *      for this server.
+ *
+ * `env` is the SDK call's effective env (process.env merged with
+ * `requestOptions.env`), not the raw `process.env`. See `EnvSource`.
+ *
+ * Returns the list of missing env-var names; empty array means "include".
+ */
+function checkServerEnvGate(
+  server: Record<string, unknown>,
+  perServerMissingVars: string[],
+  env: EnvSource
+): string[] {
+  const requireEnv = server.requireEnv;
+  if (Array.isArray(requireEnv)) {
+    const missing: string[] = [];
+    for (const name of requireEnv) {
+      if (typeof name !== 'string') continue;
+      if (lookupEnv(env, name) === undefined) missing.push(name);
+    }
+    return missing;
+  }
+  // No explicit requireEnv → fall back to "all referenced ${VAR}s resolved".
+  return [...new Set(perServerMissingVars)];
+}
+
+/**
+ * Should global MCPs be skipped for this call?
+ *
+ * The Claude provider's "routing" call uses `tools: []` to classify intent;
+ * exposing MCPs there only pays uvx cold-start latency for nothing. Treat
+ * the explicit-empty `nodeConfig.allowed_tools: []` idiom (used by the
+ * router and by `title-generator`) as the same signal.
+ */
+function isToolsDisabledCall(nodeConfig: NodeConfig | undefined): boolean {
+  if (!nodeConfig) return false;
+  return Array.isArray(nodeConfig.allowed_tools) && nodeConfig.allowed_tools.length === 0;
+}
+
+/**
+ * Merge global MCP server configs into the SDK options' mcpServers map.
+ *
+ * Per-node servers (already populated via `applyNodeConfig`) win on name
+ * conflicts — operators can override a globally-configured server inside a
+ * specific workflow node by re-declaring it under the same name.
+ *
+ * `env` is the SDK call's effective env (the merge of `process.env` and
+ * `requestOptions.env`). Per-user overlays from the user_env_vars patch
+ * (Jira creds keyed by `platformUserId`) live in `requestOptions.env`
+ * only — they are NOT in `process.env`. Substitution and `requireEnv`
+ * gating must use the merged env, otherwise gating reports "missing"
+ * for every user and silently skips every MCP server.
+ *
+ * Servers are silently skipped (debug-logged) when their env gate fails;
+ * load errors for individual files are warned but do NOT abort the call —
+ * one broken global MCP file should not take down every Claude workflow.
+ */
+async function applyGlobalMcp(
+  options: Options,
+  globalMcpPaths: readonly string[],
+  cwd: string,
+  nodeConfig: NodeConfig | undefined,
+  env: EnvSource
+): Promise<void> {
+  if (globalMcpPaths.length === 0) return;
+  if (isToolsDisabledCall(nodeConfig)) {
+    getLog().debug(
+      { globalMcpPaths, reason: 'tools_disabled' },
+      'claude.mcp_global_skipped_tools_disabled'
+    );
+    return;
+  }
+
+  // Partition existing per-node servers so we can let them win on conflicts.
+  const existing = (options.mcpServers ?? {}) as Record<string, unknown>;
+  const existingNames = new Set(Object.keys(existing));
+  const merged: Record<string, unknown> = { ...existing };
+  const addedNames: string[] = [];
+
+  for (const path of globalMcpPaths) {
+    let loaded: Awaited<ReturnType<typeof loadMcpConfig>>;
+    try {
+      loaded = await loadMcpConfig(path, cwd, env);
+    } catch (err) {
+      const e = err as Error;
+      getLog().warn({ path, err: e.message }, 'claude.mcp_global_load_failed');
+      continue;
+    }
+
+    // Per-server gating: a server is skipped when its `requireEnv` lists a
+    // var that is missing/empty, OR (when `requireEnv` is absent) when any
+    // `${VAR}` referenced in its env/headers resolved to undefined during
+    // the initial expansion. The per-server missing-var attribution comes
+    // from `loaded.perServerMissingVars` — re-expanding the already-expanded
+    // record here would falsely report zero missing vars.
+    for (const [serverName, rawServer] of Object.entries(loaded.servers)) {
+      if (existingNames.has(serverName)) {
+        getLog().debug({ serverName, path }, 'claude.mcp_global_skipped_per_node_override');
+        continue;
+      }
+      if (typeof rawServer !== 'object' || rawServer === null) {
+        getLog().warn({ serverName, path }, 'claude.mcp_global_server_not_object');
+        continue;
+      }
+      const server = rawServer as Record<string, unknown>;
+      const perServerMissing = loaded.perServerMissingVars.get(serverName) ?? [];
+
+      const missing = checkServerEnvGate(server, perServerMissing, env);
+      if (missing.length > 0) {
+        getLog().debug(
+          { serverName, path, missingVars: missing },
+          'claude.mcp_global_skipped_missing_env'
+        );
+        continue;
+      }
+
+      merged[serverName] = stripRequireEnv(server);
+      existingNames.add(serverName);
+      addedNames.push(serverName);
+    }
+  }
+
+  if (addedNames.length === 0) return;
+
+  options.mcpServers = merged as Options['mcpServers'];
+  const newWildcards = addedNames.map(name => `mcp__${name}__*`);
+  options.allowedTools = [...(options.allowedTools ?? []), ...newWildcards];
+  getLog().info({ addedNames, paths: globalMcpPaths }, 'claude.mcp_global_merged');
 }
 
 // ─── SDK Hooks Building (absorbed from dag-executor) ───────────────────────
@@ -990,6 +1212,21 @@ export class ClaudeProvider implements IAgentProvider {
       // 2. Apply nodeConfig translation (re-applied per attempt since options are fresh)
       if (requestOptions?.nodeConfig) {
         await applyNodeConfig(options, requestOptions.nodeConfig, cwd);
+      }
+
+      // 2b. Merge global MCPs (after per-node MCPs so the operator override
+      // wins on name conflicts). Skipped on tools-disabled (routing) calls.
+      // Pass `env` (process.env merged with requestOptions.env) so per-user
+      // overlays from the user_env_vars patch reach the gate — gating can't
+      // see them in process.env alone.
+      if (requestOptions?.globalMcp && requestOptions.globalMcp.length > 0) {
+        await applyGlobalMcp(
+          options,
+          requestOptions.globalMcp,
+          cwd,
+          requestOptions.nodeConfig,
+          env as EnvSource
+        );
       }
 
       // 3. Set session resume

@@ -2,7 +2,7 @@
 
 You are on the `youbiquity` branch of `Youbiquity-00001-Backup/Archon` —
 a soft-fork of upstream `coleam00/Archon` that tracks upstream `main`
-and carries three private patches:
+and carries four private patches:
 
 1. **`user_env_vars`** — per-user env injection at the orchestrator's
    `requestOptions` build site, threaded via `HandleMessageContext.platformUserId`.
@@ -13,6 +13,13 @@ and carries three private patches:
    `UserCredsService.syncFromDisk`, GitHub OAuth refresh via
    `ensureFreshGithub`, and tombstone handling for dead refresh chains.
    See [`archon-youbiquity/USER-CREDS-PERSISTENCE-DESIGN.md`](https://github.com/Youbiquity-00001-Backup/archon-youbiquity/blob/main/USER-CREDS-PERSISTENCE-DESIGN.md).
+4. **`global_mcp`** — `globalMcp:` list in `.archon/config.yaml` (and
+   `~/.archon/config.yaml`) merged into every Claude SDK call via
+   `SendQueryOptions.globalMcp`. Per-server `requireEnv` gates the spawn
+   on env-var presence, so users without linked creds silently skip.
+   Wires `mcp-atlassian` into every Claude workflow once the user has
+   linked Jira creds via `/archon-creds jira` — no per-workflow opt-in.
+   See [`JIRA-MCP-PLAN.md`](./JIRA-MCP-PLAN.md).
 
 See [`PATCH-PLAN.md`](./PATCH-PLAN.md) for the full design.
 
