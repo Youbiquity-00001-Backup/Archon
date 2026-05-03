@@ -8,7 +8,6 @@ export {
   getArchonConfigPath,
   getInstallDir,
   getBundledConfigPath,
-  resetInstallDirForTesting,
   getArchonEnvPath,
   getRepoArchonEnvPath,
   getHomeWorkflowsPath,

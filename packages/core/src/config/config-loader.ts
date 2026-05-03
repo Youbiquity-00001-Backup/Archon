@@ -610,6 +610,19 @@ export async function loadConfig(repoPath?: string): Promise<MergedConfig> {
   // 4. Apply environment overrides (highest precedence)
   config = applyEnvOverrides(config);
 
+  // Diagnostic: surface what `globalMcp:` resolved to, so deploys can be
+  // verified from logs without exec'ing into the container. Cheap (one
+  // line per loadConfig call) and observable at LOG_LEVEL=info.
+  getLog().info(
+    {
+      globalMcp: config.globalMcp ?? [],
+      bundledConfigPath: getBundledConfigPath(),
+      installDir: getInstallDir(),
+      repoPath: repoPath ?? null,
+    },
+    'config.loaded'
+  );
+
   return config;
 }
 

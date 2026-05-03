@@ -97,28 +97,27 @@ export function getArchonConfigPath(): string {
 }
 
 /**
- * Directory the Archon process was launched from. Used as the anchor for
- * the **bundled-config layer** (the source-shipped `<installDir>/.archon/`
- * tree that ships in the Docker image / source checkout). Captured lazily
- * on first call.
+ * Archon's source-install directory — the parent of the source-shipped
+ * `.archon/` tree (`mcp/jira.json`, bundled `config.yaml`, default
+ * commands/workflows, etc.). Derived from `getAppArchonBasePath()` so it
+ * resolves the same way as `getDefaultCommandsPath()` and friends.
  *
- * Why a separate concept from per-call `cwd`:
- * - Workflow/SDK calls receive an explicit `cwd` argument that points at
- *   the user's workspace (e.g. `~/.archon/workspaces/owner/repo/source/`).
- *   That is the *runtime* cwd for an individual call.
- * - The Archon process itself starts from a fixed directory (Dockerfile
- *   `WORKDIR`, repo root in source mode). That is the *install* dir, and
- *   it's where the source-shipped `.archon/` tree lives — `mcp/jira.json`,
- *   bundled `config.yaml`, etc.
+ * Why NOT `process.cwd()`:
+ * - `bun --filter @archon/server start` (the production entrypoint)
+ *   runs from `packages/server/`, so `process.cwd()` is the server
+ *   package, not the install root. Anchoring `getBundledConfigPath()`
+ *   on cwd silently mis-resolves and the bundled config is never read.
+ * - `import.meta.dir`-derived paths anchor to the actual location of
+ *   the `archon-paths.ts` file at runtime, which IS the install root
+ *   regardless of where the process was launched.
  *
- * Captured lazily so tests can mock by `chdir`-ing before first call.
+ * Local repro of the cwd bug: `cd packages/server && bun -e "..."`
+ * showed `getBundledConfigPath()` returning `packages/server/.archon/`
+ * (no file there) instead of the repo root.
  */
-let cachedInstallDir: string | undefined;
 export function getInstallDir(): string {
-  if (cachedInstallDir === undefined) {
-    cachedInstallDir = process.cwd();
-  }
-  return cachedInstallDir;
+  // dirname of `<installDir>/.archon` — peel off the trailing `.archon`.
+  return dirname(getAppArchonBasePath());
 }
 
 /**
@@ -131,15 +130,7 @@ export function getInstallDir(): string {
  * and per-repo configs override it.
  */
 export function getBundledConfigPath(): string {
-  return join(getInstallDir(), '.archon', 'config.yaml');
-}
-
-/**
- * Reset the cached install dir. Test-only — used after `process.chdir()`
- * in tests that need to control the bundled-config location.
- */
-export function resetInstallDirForTesting(): void {
-  cachedInstallDir = undefined;
+  return join(getAppArchonBasePath(), 'config.yaml');
 }
 
 /**
