@@ -9,11 +9,14 @@
  */
 
 import { readFile as fsReadFile, writeFile, mkdir } from 'fs/promises';
-import { join, dirname } from 'path';
+import { homedir } from 'os';
+import { dirname, isAbsolute, join, resolve } from 'path';
 import {
   getArchonConfigPath,
   getArchonWorkspacesPath,
   getArchonWorktreesPath,
+  getBundledConfigPath,
+  getInstallDir,
 } from '@archon/paths';
 
 // Wrapper functions for file I/O - allows mocking without polluting fs/promises globally
@@ -258,6 +261,56 @@ export async function loadRepoConfig(repoPath: string): Promise<RepoConfig> {
 }
 
 /**
+ * Load source-shipped bundled config from `<installDir>/.archon/config.yaml`.
+ *
+ * This is the lowest-priority config layer — it ships with the Archon
+ * source / Docker image and lets a fork carry operator-level defaults
+ * (e.g. the youbiquity branch's `globalMcp:` entry that activates Jira
+ * MCP) without requiring an infra-side template change. `~/.archon/`
+ * and per-repo configs override anything declared here.
+ *
+ * Treated as a `RepoConfig`-shaped file: it can declare any field a
+ * repo `.archon/config.yaml` can declare. In practice forks should keep
+ * it minimal — operator overrides are the more flexible surface.
+ *
+ * Returns empty object if not present (the common case for upstream).
+ */
+export async function loadBundledConfig(): Promise<RepoConfig> {
+  const configPath = getBundledConfigPath();
+
+  try {
+    const content = await readConfigFile(configPath);
+    return (parseYaml(content) as RepoConfig) ?? {};
+  } catch (error) {
+    const err = error as { code?: string };
+    if (err.code === 'ENOENT') return {};
+    logConfigError(configPath, error);
+    return {};
+  }
+}
+
+/**
+ * Resolve relative `globalMcp:` entries to absolute paths anchored at
+ * `anchor` (the parent of the `.archon/` directory the config came from).
+ *
+ * Why parent-of-`.archon/` and not the dir of `.archon/config.yaml`:
+ * the existing per-node `mcp:` field interprets paths relative to the
+ * workflow cwd (= repo root). Anchoring `globalMcp` at the parent of
+ * `.archon/` lines up with that — `.archon/mcp/jira.json` means the
+ * same thing in `<repo>/.archon/config.yaml` whether it's per-node
+ * `mcp:` or top-level `globalMcp:`.
+ *
+ * Absolute entries pass through unchanged. Empty list → empty list.
+ */
+function resolveGlobalMcpPaths(
+  paths: readonly string[] | undefined,
+  anchor: string
+): string[] | undefined {
+  if (!paths || paths.length === 0) return paths === undefined ? undefined : [];
+  return paths.map(p => (isAbsolute(p) ? p : resolve(anchor, p)));
+}
+
+/**
  * Get default configuration
  */
 function getDefaults(): MergedConfig {
@@ -410,11 +463,41 @@ function mergeGlobalConfig(defaults: MergedConfig, global: GlobalConfig): Merged
     result.userEnvVars = global.userEnvVars;
   }
 
-  // Global-scope MCP config files. Repo entries are appended later in
-  // mergeRepoConfig — order matters because per-node MCPs already win
-  // on name conflict; among global entries, last-listed wins.
-  if (global.globalMcp && global.globalMcp.length > 0) {
-    result.globalMcp = [...global.globalMcp];
+  // Global-scope MCP config files. Bundled-config entries (added in
+  // mergeBundledConfig before this layer) and repo entries (added later
+  // in mergeRepoConfig) layer in: bundled < global < repo. Per-node
+  // MCPs already win on name conflict; among global entries, last-listed
+  // wins. Paths anchor at `~` (parent of `~/.archon/`).
+  const resolvedGlobalMcp = resolveGlobalMcpPaths(global.globalMcp, homedir());
+  if (resolvedGlobalMcp && resolvedGlobalMcp.length > 0) {
+    result.globalMcp = [...(result.globalMcp ?? []), ...resolvedGlobalMcp];
+  }
+
+  return result;
+}
+
+/**
+ * Merge source-shipped bundled config into the merged config (lowest
+ * priority above hardcoded defaults). Mirrors `mergeRepoConfig` but
+ * with the bundled config dir as the path-anchor.
+ *
+ * Only fields that are sensible to ship as fork-level operator defaults
+ * are propagated here. Currently: `globalMcp:`. Other fields that vary
+ * per-deployment (envVars, baseBranch, docs.path) are not propagated —
+ * they belong in `~/.archon/config.yaml` or per-repo config.
+ */
+function mergeBundledConfig(merged: MergedConfig, bundled: RepoConfig): MergedConfig {
+  const result: MergedConfig = {
+    ...merged,
+    assistants: mergeAssistantDefaults(merged.assistants),
+  };
+
+  // Bundled `.archon/config.yaml` lives at `<installDir>/.archon/config.yaml`,
+  // so paths anchor at `<installDir>` (parent of `.archon/`) — same rule as
+  // per-repo configs.
+  const resolved = resolveGlobalMcpPaths(bundled.globalMcp, getInstallDir());
+  if (resolved && resolved.length > 0) {
+    result.globalMcp = [...(result.globalMcp ?? []), ...resolved];
   }
 
   return result;
@@ -423,7 +506,7 @@ function mergeGlobalConfig(defaults: MergedConfig, global: GlobalConfig): Merged
 /**
  * Merge repo config into merged config
  */
-function mergeRepoConfig(merged: MergedConfig, repo: RepoConfig): MergedConfig {
+function mergeRepoConfig(merged: MergedConfig, repo: RepoConfig, repoPath: string): MergedConfig {
   const result: MergedConfig = {
     ...merged,
     assistants: mergeAssistantDefaults(merged.assistants),
@@ -484,8 +567,11 @@ function mergeRepoConfig(merged: MergedConfig, repo: RepoConfig): MergedConfig {
   }
 
   // Append repo-level global MCP files after any global-config entries.
-  if (repo.globalMcp && repo.globalMcp.length > 0) {
-    result.globalMcp = [...(result.globalMcp ?? []), ...repo.globalMcp];
+  // Paths anchor at `repoPath` (parent of `<repoPath>/.archon/`) so they
+  // line up with the per-node `mcp:` field's anchor (workflow cwd).
+  const resolvedRepoMcp = resolveGlobalMcpPaths(repo.globalMcp, repoPath);
+  if (resolvedRepoMcp && resolvedRepoMcp.length > 0) {
+    result.globalMcp = [...(result.globalMcp ?? []), ...resolvedRepoMcp];
   }
 
   return result;
@@ -501,17 +587,24 @@ export async function loadConfig(repoPath?: string): Promise<MergedConfig> {
   registerBuiltinProviders();
   registerCommunityProviders();
 
-  // 1. Start with defaults
+  // 1. Start with hardcoded defaults
   let config = getDefaults();
 
-  // 2. Apply global config
+  // 1.5. Source-shipped bundled config (`<installDir>/.archon/config.yaml`).
+  // Lowest-priority operator-style layer — fork-shipped defaults like
+  // `globalMcp:`. Loaded BEFORE the user-managed `~/.archon/config.yaml`
+  // so the operator can override it on a per-deployment basis.
+  const bundledConfig = await loadBundledConfig();
+  config = mergeBundledConfig(config, bundledConfig);
+
+  // 2. Apply global config (`~/.archon/config.yaml`)
   const globalConfig = await loadGlobalConfig();
   config = mergeGlobalConfig(config, globalConfig);
 
   // 3. Apply repo config if path provided
   if (repoPath) {
     const repoConfig = await loadRepoConfig(repoPath);
-    config = mergeRepoConfig(config, repoConfig);
+    config = mergeRepoConfig(config, repoConfig, repoPath);
   }
 
   // 4. Apply environment overrides (highest precedence)

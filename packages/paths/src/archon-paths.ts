@@ -97,6 +97,52 @@ export function getArchonConfigPath(): string {
 }
 
 /**
+ * Directory the Archon process was launched from. Used as the anchor for
+ * the **bundled-config layer** (the source-shipped `<installDir>/.archon/`
+ * tree that ships in the Docker image / source checkout). Captured lazily
+ * on first call.
+ *
+ * Why a separate concept from per-call `cwd`:
+ * - Workflow/SDK calls receive an explicit `cwd` argument that points at
+ *   the user's workspace (e.g. `~/.archon/workspaces/owner/repo/source/`).
+ *   That is the *runtime* cwd for an individual call.
+ * - The Archon process itself starts from a fixed directory (Dockerfile
+ *   `WORKDIR`, repo root in source mode). That is the *install* dir, and
+ *   it's where the source-shipped `.archon/` tree lives — `mcp/jira.json`,
+ *   bundled `config.yaml`, etc.
+ *
+ * Captured lazily so tests can mock by `chdir`-ing before first call.
+ */
+let cachedInstallDir: string | undefined;
+export function getInstallDir(): string {
+  if (cachedInstallDir === undefined) {
+    cachedInstallDir = process.cwd();
+  }
+  return cachedInstallDir;
+}
+
+/**
+ * Path to the source-shipped bundled config file
+ * (`<installDir>/.archon/config.yaml`).
+ *
+ * Forks of Archon use this to ship operator-level defaults (e.g. the
+ * youbiquity branch's `globalMcp:` entry that activates Jira MCP).
+ * Loaded as the lowest-priority config layer — `~/.archon/config.yaml`
+ * and per-repo configs override it.
+ */
+export function getBundledConfigPath(): string {
+  return join(getInstallDir(), '.archon', 'config.yaml');
+}
+
+/**
+ * Reset the cached install dir. Test-only — used after `process.chdir()`
+ * in tests that need to control the bundled-config location.
+ */
+export function resetInstallDirForTesting(): void {
+  cachedInstallDir = undefined;
+}
+
+/**
  * Get the home-scoped workflows directory (`~/.archon/workflows/`).
  * Workflows placed here are discovered from every repo and apply globally —
  * overridden per-filename by the same name under `<repoRoot>/.archon/workflows/`.

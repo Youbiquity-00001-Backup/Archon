@@ -5,6 +5,7 @@ import { createMockLogger } from '../test/mocks/logger';
 
 const mockLogger = createMockLogger();
 const archonHome = join(homedir(), '.archon');
+const installDir = '/test-install';
 mock.module('@archon/paths', () => ({
   createLogger: mock(() => mockLogger),
   getArchonHome: mock(() => archonHome),
@@ -13,6 +14,8 @@ mock.module('@archon/paths', () => ({
   getArchonWorktreesPath: mock(() => join(archonHome, 'worktrees')),
   getDefaultCommandsPath: mock(() => '/app/.archon/commands/defaults'),
   getDefaultWorkflowsPath: mock(() => '/app/.archon/workflows/defaults'),
+  getInstallDir: mock(() => installDir),
+  getBundledConfigPath: mock(() => join(installDir, '.archon', 'config.yaml')),
 }));
 
 // Mock for reading/writing config files (replaces fs/promises mock)
@@ -283,6 +286,13 @@ streaming:
 
       let globalConfigRead = false;
       mockReadConfigFile.mockImplementation(async (path: string) => {
+        // Bundled config layer: not under test here, treat as absent so the
+        // first `.archon/config.yaml` read still routes to the global layer.
+        if (path.replace(/\\/g, '/').startsWith(installDir)) {
+          const e = new Error('ENOENT') as NodeJS.ErrnoException;
+          e.code = 'ENOENT';
+          throw e;
+        }
         // First check for repo-specific config path (contains /repo/.archon/)
         if (pathMatches(path, '/repo/.archon/config.yaml')) {
           return 'assistant: codex';
@@ -309,6 +319,13 @@ streaming:
 
       let globalConfigRead = false;
       mockReadConfigFile.mockImplementation(async (path: string) => {
+        // Bundled config layer: not under test here, treat as absent so the
+        // first `.archon/config.yaml` read still routes to the global layer.
+        if (path.replace(/\\/g, '/').startsWith(installDir)) {
+          const e = new Error('ENOENT') as NodeJS.ErrnoException;
+          e.code = 'ENOENT';
+          throw e;
+        }
         if (pathMatches(path, '/repo/.archon/config.yaml')) {
           return `assistants:\n  codex:\n    webSearchMode: live\n    additionalDirectories:\n      - /repo\n`;
         }
@@ -337,6 +354,13 @@ streaming:
 
       let globalConfigRead = false;
       mockReadConfigFile.mockImplementation(async (path: string) => {
+        // Bundled config layer: not under test here, treat as absent so the
+        // first `.archon/config.yaml` read still routes to the global layer.
+        if (path.replace(/\\/g, '/').startsWith(installDir)) {
+          const e = new Error('ENOENT') as NodeJS.ErrnoException;
+          e.code = 'ENOENT';
+          throw e;
+        }
         if (pathMatches(path, '.archon/config.yaml') && !globalConfigRead) {
           globalConfigRead = true;
           return [
@@ -371,20 +395,21 @@ streaming:
       expect(config.userEnvVars).toBeUndefined();
     });
 
-    test('propagates globalMcp paths and appends repo entries after global', async () => {
-      const pathMatches = (path: string, pattern: string): boolean => {
-        const normalizedPath = path.replace(/\\/g, '/');
-        return normalizedPath.includes(pattern);
-      };
-
-      let globalConfigRead = false;
+    test('globalMcp paths resolve absolute and layer bundled < global < repo', async () => {
+      const norm = (p: string): string => p.replace(/\\/g, '/');
       mockReadConfigFile.mockImplementation(async (path: string) => {
-        if (pathMatches(path, '/repo/.archon/config.yaml')) {
+        const normalized = norm(path);
+        if (normalized === norm(join(installDir, '.archon', 'config.yaml'))) {
+          // Bundled (lowest priority). Relative path anchors at installDir.
           return ['globalMcp:', '  - .archon/mcp/jira.json'].join('\n');
         }
-        if (pathMatches(path, '.archon/config.yaml') && !globalConfigRead) {
-          globalConfigRead = true;
+        if (normalized === norm(join(archonHome, 'config.yaml'))) {
+          // Global (~/.archon/config.yaml). Already absolute.
           return ['globalMcp:', '  - /shared/mcp/internal.json'].join('\n');
+        }
+        if (normalized.includes('/test/repo/.archon/config.yaml')) {
+          // Repo. Relative anchor: repoPath = `/test/repo`.
+          return ['globalMcp:', '  - .archon/mcp/repo-only.json'].join('\n');
         }
         const error = new Error('ENOENT') as NodeJS.ErrnoException;
         error.code = 'ENOENT';
@@ -392,10 +417,29 @@ streaming:
       });
 
       const config = await loadConfig('/test/repo');
-      expect(config.globalMcp).toEqual(['/shared/mcp/internal.json', '.archon/mcp/jira.json']);
+      expect(config.globalMcp).toEqual([
+        join(installDir, '.archon', 'mcp', 'jira.json'),
+        '/shared/mcp/internal.json',
+        join('/test/repo', '.archon', 'mcp', 'repo-only.json'),
+      ]);
     });
 
-    test('globalMcp is undefined when not configured', async () => {
+    test('bundled-config globalMcp survives even when no operator/repo config sets it', async () => {
+      const norm = (p: string): string => p.replace(/\\/g, '/');
+      mockReadConfigFile.mockImplementation(async (path: string) => {
+        if (norm(path) === norm(join(installDir, '.archon', 'config.yaml'))) {
+          return ['globalMcp:', '  - .archon/mcp/jira.json'].join('\n');
+        }
+        const error = new Error('ENOENT') as NodeJS.ErrnoException;
+        error.code = 'ENOENT';
+        throw error;
+      });
+
+      const config = await loadConfig();
+      expect(config.globalMcp).toEqual([join(installDir, '.archon', 'mcp', 'jira.json')]);
+    });
+
+    test('globalMcp is undefined when not configured anywhere', async () => {
       mockReadConfigFile.mockImplementation(async () => {
         const error = new Error('ENOENT') as NodeJS.ErrnoException;
         error.code = 'ENOENT';
@@ -581,6 +625,13 @@ assistants:
 
       let globalConfigRead = false;
       mockReadConfigFile.mockImplementation(async (path: string) => {
+        // Bundled config layer: not under test here, treat as absent so the
+        // first `.archon/config.yaml` read still routes to the global layer.
+        if (path.replace(/\\/g, '/').startsWith(installDir)) {
+          const e = new Error('ENOENT') as NodeJS.ErrnoException;
+          e.code = 'ENOENT';
+          throw e;
+        }
         if (pathMatches(path, '/repo/.archon/config.yaml')) {
           return `assistants:\n  claude:\n    settingSources:\n      - project\n`;
         }
