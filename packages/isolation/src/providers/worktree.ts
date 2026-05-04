@@ -770,6 +770,20 @@ export class WorktreeProvider implements IIsolationProvider {
     repoPath: RepoPath,
     configuredBaseBranch?: string
   ): Promise<string> {
+    // Surface missing source dir before git runs, so the user gets an
+    // actionable message instead of a 200-char "fatal: cannot change to ..."
+    // error wrapped in a misleading "Check your network connection" hint.
+    // Common after Fargate task replacement when ~/.archon/workspaces/ is
+    // ephemeral but the codebase DB row survives.
+    try {
+      await access(repoPath);
+    } catch {
+      throw new Error(
+        `Codebase source missing on disk at ${repoPath}. ` +
+          'Re-register the codebase, or restore the workspace clone.'
+      );
+    }
+
     try {
       getLog().debug(
         { repoPath, branch: configuredBaseBranch ?? 'auto-detect' },

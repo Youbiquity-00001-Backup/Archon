@@ -58,6 +58,14 @@ const ERROR_PATTERNS: { pattern: string; message: string; known: boolean }[] = [
     known: true,
   },
   {
+    pattern: 'codebase source missing',
+    message:
+      '**Error:** Codebase source directory missing on disk. The clone was lost ' +
+      '(common after a container restart with ephemeral storage). Re-register the ' +
+      'codebase, or restore the workspace clone before retrying.',
+    known: true,
+  },
+  {
     // Deliberately not `known` — this is a user-input / registration bug,
     // not an infrastructure failure. Surface classification, but crash.
     pattern: 'cannot extract owner/repo',
