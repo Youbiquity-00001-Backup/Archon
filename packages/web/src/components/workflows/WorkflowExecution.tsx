@@ -50,19 +50,56 @@ interface WorkflowRunQueryData {
   conversationPlatformId: string | null;
   codebaseId: string | null;
   events: WorkflowEventResponse[];
+  // Raw run.metadata, threaded through so the badge can detect the
+  // approve/reject "failed" state set by workflow-operations.ts.
+  // Not part of WorkflowState because it's display-only here.
+  runMetadata: Record<string, unknown> | null;
 }
 
 interface WorkflowExecutionProps {
   runId: string;
 }
 
-function StatusBadge({ status }: { status: string }): React.ReactElement {
+/**
+ * Render the run-level status badge.
+ *
+ * `pendingResume` exists because `approveWorkflow` and `rejectWorkflow`
+ * (in @archon/core/operations/workflow-operations.ts) intentionally set
+ * `status: 'failed'` so the existing `findResumableRun` mechanism picks
+ * the run up on the next message in the parent conversation. The DB
+ * status is genuinely 'failed' until the resume completes, but the
+ * approval/rejection itself succeeded — rendering a red "FAILED" badge
+ * misrepresents the state. Callers detect the case via the run's
+ * metadata (approval_response='approved', loop_user_input set, or
+ * rejection_reason set) and pass a derived label here.
+ */
+function StatusBadge({
+  status,
+  pendingResume,
+}: {
+  status: string;
+  pendingResume?: 'approved' | 'rejected';
+}): React.ReactElement {
+  if (status === 'failed' && pendingResume) {
+    const label =
+      pendingResume === 'approved' ? 'approved · resume pending' : 'rejected · revision pending';
+    return (
+      <span
+        className="px-2 py-0.5 rounded-full text-xs font-medium bg-warning/10 text-warning"
+        title="Approval recorded; the run is waiting for the next message in the parent conversation to resume."
+      >
+        {label}
+      </span>
+    );
+  }
+
   const colors: Record<string, string> = {
     pending: 'bg-accent/20 text-accent',
     running: 'bg-accent/20 text-accent',
     completed: 'bg-success/20 text-success',
     failed: 'bg-error/20 text-error',
     cancelled: 'bg-surface text-text-secondary',
+    paused: 'bg-warning/10 text-warning',
   };
   return (
     <span
@@ -71,6 +108,30 @@ function StatusBadge({ status }: { status: string }): React.ReactElement {
       {status}
     </span>
   );
+}
+
+/**
+ * Detect whether a run with `status='failed'` is actually an approval
+ * gate result waiting to resume. See StatusBadge for the rationale.
+ *
+ * Mirrors the metadata shape `approveWorkflow` / `rejectWorkflow` write:
+ *   - Approve (gate):  metadata.approval_response === 'approved'
+ *   - Approve (loop):  metadata.loop_user_input present (any value)
+ *   - Reject:          metadata.rejection_reason non-empty AND no approval marker
+ */
+function detectPendingResume(
+  status: string,
+  metadata: Record<string, unknown> | undefined
+): 'approved' | 'rejected' | undefined {
+  if (status !== 'failed' || !metadata) return undefined;
+  if (metadata.approval_response === 'approved' || typeof metadata.loop_user_input === 'string') {
+    return 'approved';
+  }
+  const reason = metadata.rejection_reason;
+  if (typeof reason === 'string' && reason.length > 0) {
+    return 'rejected';
+  }
+  return undefined;
 }
 
 export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.ReactElement {
@@ -201,6 +262,7 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
         conversationPlatformId: data.run.conversation_platform_id ?? null,
         codebaseId: data.run.codebase_id ?? null,
         events: data.events,
+        runMetadata: (data.run.metadata as Record<string, unknown> | undefined) ?? null,
       };
     },
     refetchInterval: (query): number | false => {
@@ -607,7 +669,13 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
         </button>
         <div className="flex items-center gap-2 min-w-0">
           <h2 className="font-semibold text-text-primary truncate">{workflow.workflowName}</h2>
-          <StatusBadge status={workflow.status} />
+          <StatusBadge
+            status={workflow.status}
+            pendingResume={detectPendingResume(
+              workflow.status,
+              queryData?.runMetadata ?? undefined
+            )}
+          />
         </div>
         <div className="flex items-center gap-2 ml-auto shrink-0">
           {codebaseName && <span className="text-xs text-text-secondary">{codebaseName}</span>}
