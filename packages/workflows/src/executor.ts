@@ -226,6 +226,14 @@ async function resolveProjectPaths(
  *   - Used to substitute $CONTEXT, $EXTERNAL_CONTEXT, $ISSUE_CONTEXT variables in prompts
  *   - Appended to prompts if no context variables are present (to ensure AI receives context)
  *   Expected format: Markdown with issue title, author, labels, and body
+ * @param userEnvOverlay - Optional per-user env overlay (CLAUDE_CODE_OAUTH_TOKEN,
+ *   GH_TOKEN, JIRA_*, HOME, etc.) built by the orchestrator from the live
+ *   `UserCredsService.getEnvOverlay()` lookup. Merged into `config.envVars` so
+ *   per-user OAuth tokens reach AI nodes (via SendQueryOptions.env) and
+ *   bash/script subprocesses. Without this, workflow nodes fall back to the
+ *   image-baked default credentials (~/.claude/.credentials.json) which the
+ *   user cannot refresh from chat — `/archon-creds anthropic` only updates
+ *   per-user creds.
  */
 export async function executeWorkflow(
   deps: WorkflowDeps,
@@ -244,14 +252,19 @@ export async function executeWorkflow(
     prBranch?: string;
   },
   parentConversationId?: string,
-  preCreatedRun?: WorkflowRun
+  preCreatedRun?: WorkflowRun,
+  userEnvOverlay?: Record<string, string>
 ): Promise<WorkflowExecutionResult> {
   // Load config once for the entire workflow execution
   const fileConfig = await deps.loadConfig(cwd);
   const dbEnvVars = codebaseId ? await deps.store.getCodebaseEnvVars(codebaseId) : {};
+  // Merge order matches the orchestrator routing call (orchestrator-agent.ts):
+  // file < db < user-overlay. Per-user overlay wins so a refreshed
+  // CLAUDE_CODE_OAUTH_TOKEN takes effect on the next workflow run without a
+  // server restart.
   const config: WorkflowConfig = {
     ...fileConfig,
-    envVars: { ...fileConfig.envVars, ...dbEnvVars },
+    envVars: { ...fileConfig.envVars, ...dbEnvVars, ...(userEnvOverlay ?? {}) },
   };
   const configuredCommandFolder = config.commands.folder;
 

@@ -246,6 +246,14 @@ export interface WorkflowRoutingContext {
    * Hints for isolation environment (PR review context, etc.)
    */
   readonly isolationHints?: IsolationHints;
+  /**
+   * Per-user env overlay (CLAUDE_CODE_OAUTH_TOKEN, GH_TOKEN, JIRA_*, HOME, etc.)
+   * built by the orchestrator from `UserCredsService.getEnvOverlay()`. Forwarded
+   * to `executeWorkflow` so the worker run uses the requesting user's
+   * credentials instead of the image-baked default. Undefined for paths with
+   * no platform user identity (CLI, GitHub webhook before identity resolves).
+   */
+  readonly userEnvOverlay?: Record<string, string>;
 }
 
 /**
@@ -374,7 +382,8 @@ export async function dispatchBackgroundWorkflow(
           ctx.issueContext,
           isolationContext,
           ctx.conversationDbId,
-          preCreatedRun
+          preCreatedRun,
+          ctx.userEnvOverlay
         );
         // Surface workflow output to parent conversation as a result card
         if ('paused' in result) {

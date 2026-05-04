@@ -209,6 +209,46 @@ function filterToolIndicators(assistantMessages: string[]): string {
 // ─── Workflow Dispatch ──────────────────────────────────────────────────────
 
 /**
+ * Build the per-user env overlay for a workflow dispatch.
+ *
+ * Mirrors the orchestrator routing-call logic (see handleMessage's
+ * requestOptions construction): refreshes a near-expiry GitHub token for
+ * the user, then returns the live UserCredsService overlay
+ * (CLAUDE_CODE_OAUTH_TOKEN, GH_TOKEN, JIRA_*, HOME).
+ *
+ * Returns undefined when:
+ *   - There is no platformUserId (CLI / unauthenticated paths), OR
+ *   - No UserCredsService is registered (CLI / tests), OR
+ *   - The user has no cache entry (creds never linked).
+ *
+ * Workflow execution falls back to the image-baked default credentials
+ * when this returns undefined — same behavior as before this overlay
+ * threading existed.
+ */
+async function buildUserEnvOverlayForWorkflow(
+  platformUserId: string | undefined
+): Promise<Record<string, string> | undefined> {
+  if (!platformUserId) return undefined;
+  const userCreds = getUserCredsService();
+  if (!userCreds) return undefined;
+  // Refresh any near-expiry GitHub token before snapshotting the overlay so
+  // the workflow nodes see a fresh GH_TOKEN. ensureFreshGithub is a no-op
+  // when nothing is due — paid only when the token is actually expiring.
+  await userCreds.ensureFreshGithub(platformUserId);
+  const overlay = userCreds.getEnvOverlay(platformUserId);
+  if (!overlay) return undefined;
+  // UserEnvOverlay is a typed interface with optional keys (HOME, GH_TOKEN,
+  // CLAUDE_CODE_OAUTH_TOKEN, JIRA_*); coerce to Record<string, string> by
+  // dropping any undefined fields so executeWorkflow can merge it into
+  // config.envVars without producing `key: undefined` entries.
+  const filtered: Record<string, string> = {};
+  for (const [k, v] of Object.entries(overlay)) {
+    if (typeof v === 'string') filtered[k] = v;
+  }
+  return Object.keys(filtered).length > 0 ? filtered : undefined;
+}
+
+/**
  * Dispatch a workflow after the orchestrator resolves a project.
  * Auto-attaches the project to the conversation, resolves isolation, and executes.
  *
@@ -222,7 +262,8 @@ async function dispatchOrchestratorWorkflow(
   codebase: Codebase,
   workflow: WorkflowDefinition,
   userMessage: string,
-  isolationHints?: HandleMessageContext['isolationHints']
+  isolationHints?: HandleMessageContext['isolationHints'],
+  platformUserId?: string
 ): Promise<void> {
   // Auto-attach project to conversation
   await db.updateConversation(conversation.id, {
@@ -268,6 +309,11 @@ async function dispatchOrchestratorWorkflow(
     }
   }
 
+  // Build per-user env overlay once for this dispatch — same overlay is
+  // forwarded to all three foreground branches and the background-worker
+  // dispatch below. Refreshes a near-expiry GitHub token as a side effect.
+  const userEnvOverlay = await buildUserEnvOverlayForWorkflow(platformUserId);
+
   // Dispatch workflow
   if (platform.getPlatformType() === 'web') {
     // Check for a resumable run from a prior dispatch (e.g. approved approval gate).
@@ -297,7 +343,9 @@ async function dispatchOrchestratorWorkflow(
         codebase.id,
         undefined, // issueContext
         undefined, // isolationContext
-        conversation.id // parentConversationId — enables approve/reject auto-resume
+        conversation.id, // parentConversationId — enables approve/reject auto-resume
+        undefined, // preCreatedRun
+        userEnvOverlay
       );
     } else if (workflow.interactive) {
       // Interactive workflows run in foreground so output stays in the user's conversation
@@ -312,7 +360,9 @@ async function dispatchOrchestratorWorkflow(
         codebase.id,
         undefined, // issueContext
         undefined, // isolationContext
-        conversation.id // parentConversationId — enables approve/reject auto-resume
+        conversation.id, // parentConversationId — enables approve/reject auto-resume
+        undefined, // preCreatedRun
+        userEnvOverlay
       );
     } else {
       await dispatchBackgroundWorkflow(
@@ -325,6 +375,7 @@ async function dispatchOrchestratorWorkflow(
           codebaseId: codebase.id,
           availableWorkflows: [workflow],
           isolationHints,
+          userEnvOverlay,
         },
         workflow
       );
@@ -341,7 +392,9 @@ async function dispatchOrchestratorWorkflow(
       codebase.id,
       undefined, // issueContext
       undefined, // isolationContext
-      conversation.id // parentConversationId — enables approve/reject auto-resume
+      conversation.id, // parentConversationId — enables approve/reject auto-resume
+      undefined, // preCreatedRun
+      userEnvOverlay
     );
   }
 }
@@ -672,7 +725,8 @@ export async function handleMessage(
             codebase,
             workflow,
             pausedRun.user_message,
-            isolationHints
+            isolationHints,
+            platformUserId
           );
           getLog().info(
             { conversationId, workflowRunId: pausedRun.id, workflowName: pausedRun.workflow_name },
@@ -742,7 +796,8 @@ export async function handleMessage(
             conversation,
             result.workflow.definition,
             result.workflow.args ?? message,
-            isolationHints
+            isolationHints,
+            platformUserId
           );
         }
         return;
@@ -915,7 +970,8 @@ export async function handleMessage(
           isolationHints,
           conversation,
           issueContext,
-          requestOptions
+          requestOptions,
+          platformUserId
         );
       } else {
         await handleBatchMode(
@@ -931,7 +987,8 @@ export async function handleMessage(
           isolationHints,
           conversation,
           issueContext,
-          requestOptions
+          requestOptions,
+          platformUserId
         );
       }
     } finally {
@@ -980,7 +1037,8 @@ async function handleStreamMode(
   isolationHints: HandleMessageContext['isolationHints'],
   conversation: Conversation,
   issueContext?: string,
-  requestOptions?: SendQueryOptions
+  requestOptions?: SendQueryOptions,
+  platformUserId?: string
 ): Promise<void> {
   const allMessages: string[] = [];
   let newSessionId: string | undefined;
@@ -1088,7 +1146,8 @@ async function handleStreamMode(
       commands.workflowInvocation,
       originalMessage,
       isolationHints,
-      issueContext
+      issueContext,
+      platformUserId
     );
     return;
   }
@@ -1128,7 +1187,8 @@ async function handleBatchMode(
   isolationHints: HandleMessageContext['isolationHints'],
   conversation: Conversation,
   issueContext?: string,
-  requestOptions?: SendQueryOptions
+  requestOptions?: SendQueryOptions,
+  platformUserId?: string
 ): Promise<void> {
   const allChunks: { type: string; content: string }[] = [];
   const assistantMessages: string[] = [];
@@ -1253,7 +1313,8 @@ async function handleBatchMode(
       commands.workflowInvocation,
       originalMessage,
       isolationHints,
-      issueContext
+      issueContext,
+      platformUserId
     );
     return;
   }
@@ -1290,7 +1351,8 @@ async function handleWorkflowInvocationResult(
   invocation: WorkflowInvocation,
   originalMessage: string,
   isolationHints: HandleMessageContext['isolationHints'],
-  issueContext?: string
+  issueContext?: string,
+  platformUserId?: string
 ): Promise<void> {
   const { workflowName, projectName, remainingMessage } = invocation;
 
@@ -1322,7 +1384,8 @@ async function handleWorkflowInvocationResult(
       codebase,
       workflow,
       workflowPrompt,
-      isolationHints
+      isolationHints,
+      platformUserId
     );
     return;
   }
@@ -1490,7 +1553,8 @@ async function handleWorkflowRunCommand(
   conversation: Conversation,
   workflow: WorkflowDefinition,
   userMessage: string,
-  isolationHints?: HandleMessageContext['isolationHints']
+  isolationHints?: HandleMessageContext['isolationHints'],
+  platformUserId?: string
 ): Promise<void> {
   // Check if conversation has a project
   if (conversation.codebase_id) {
@@ -1510,7 +1574,8 @@ async function handleWorkflowRunCommand(
       codebase,
       workflow,
       userMessage,
-      isolationHints
+      isolationHints,
+      platformUserId
     );
     return;
   }
@@ -1587,7 +1652,8 @@ async function handleWorkflowRunCommand(
       codebase,
       resolvedWorkflow,
       userMessage,
-      isolationHints
+      isolationHints,
+      platformUserId
     );
     return;
   }
