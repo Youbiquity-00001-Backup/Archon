@@ -272,7 +272,12 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
       };
     },
     refetchInterval: (query): number | false => {
-      const status = query.state.data?.workflowState.status;
+      // `data` may be undefined when the query has errored before producing any
+      // value (e.g. workflow run fetch returned an error). Guard the chain so
+      // the React Query scheduler doesn't crash with "Cannot read properties of
+      // undefined (reading 'status')" — that error bubbles up to the
+      // ErrorBoundary and renders the whole route as "Something went wrong".
+      const status = query.state.data?.workflowState?.status;
       if (status && isTerminal(status)) return false;
       return 3000;
     },

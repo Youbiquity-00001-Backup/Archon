@@ -2412,7 +2412,31 @@ export function registerApiRoutes(
         }
       }
 
-      // 2. Fall back to bundled defaults (binary: embedded map; dev: also check filesystem)
+      // 2. Try home-scoped (~/.archon/workflows/) — the listing endpoint discovers
+      //    these via discoverWorkflowsWithConfig, but the show endpoint missed
+      //    them, so workflows shipped via Dockerfile.overlay (e.g. archon-execute-dag)
+      //    appeared in the list yet 404'd on detail fetch.
+      const homeWorkflowsDir = join(getArchonHome(), 'workflows');
+      const homeFilePath = join(homeWorkflowsDir, filename);
+      try {
+        const content = await readFile(homeFilePath, 'utf-8');
+        const result = parseWorkflow(content, filename);
+        if (result.error) {
+          return apiError(c, 500, `Workflow file is invalid: ${result.error.error}`);
+        }
+        return c.json({
+          workflow: result.workflow,
+          filename,
+          source: 'global' as WorkflowSource,
+        });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+          getLog().error({ err, name }, 'workflow.fetch_home_failed');
+          return apiError(c, 500, 'Failed to read home-scoped workflow');
+        }
+      }
+
+      // 3. Fall back to bundled defaults (binary: embedded map; dev: also check filesystem)
       if (Object.hasOwn(BUNDLED_WORKFLOWS, name)) {
         const bundledContent = BUNDLED_WORKFLOWS[name];
         const result = parseWorkflow(bundledContent, filename);
