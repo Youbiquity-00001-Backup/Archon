@@ -13,6 +13,9 @@ import '@archon/paths/strip-cwd-env-boot';
 import { config } from 'dotenv';
 import { resolve } from 'path';
 import { existsSync } from 'fs';
+import { mkdir, writeFile, chmod } from 'fs/promises';
+import { join } from 'path';
+import { homedir } from 'os';
 import { BUNDLED_IS_BINARY, getArchonEnvPath } from '@archon/paths';
 
 // In dev/source mode, load the repo root .env (platform tokens, API keys, etc.)
@@ -283,6 +286,15 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   );
   await userCreds.bootstrap();
   setUserCredsService(userCreds);
+
+  // FIX_GH_CREDS Step 7: bootstrap a process-level credential helper for
+  // non-orchestrator entry points (CLI workflow runs, webhook clones,
+  // any future caller without a per-user identity). When the deployment
+  // env exposes a `GH_TOKEN` (PAT), materialize it into the appuser HOME
+  // so git's `credential.helper=store` finds it. No-op when GH_TOKEN is
+  // unset — the per-user materialization in `userCreds.bootstrap()`
+  // above still covers OIDC-linked users.
+  await materializeProcessGithubCredentials();
 
   // OAuth state store for `/archon-creds github`. Process-local; multi-task
   // deployments will route the callback to the same task that minted the
@@ -1143,6 +1155,52 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   checkGhAuth().catch((err: unknown) => {
     getLog().debug({ err }, 'gh_auth.check_unexpected_error');
   });
+}
+
+/**
+ * Materialize a process-level git credential store from `process.env.GH_TOKEN`,
+ * for callers that don't have a per-user identity (CLI workflow runs, GitHub
+ * webhook clones, etc.). Writes to the appuser HOME so git's existing
+ * `credential.helper=store` mechanism (configured per-user via
+ * `UserCredsService`, or globally via this helper) finds it.
+ *
+ * Idempotent: rewrites the file on every boot. No-op when GH_TOKEN is
+ * unset (development without a deployment-wide PAT). Best-effort —
+ * failures log a warn but don't block server startup.
+ */
+async function materializeProcessGithubCredentials(): Promise<void> {
+  const token = process.env.GH_TOKEN?.trim();
+  if (!token) {
+    getLog().info('process_github_creds.skipped_no_token');
+    return;
+  }
+  const home = process.env.HOME ?? homedir();
+  const credsPath = join(home, '.git-credentials');
+  const gitconfigPath = join(home, '.gitconfig');
+  try {
+    await mkdir(home, { recursive: true });
+    // Canonical x-access-token form — same shape as UserCredsService.materialize.
+    const credsLine = `https://x-access-token:${token}@github.com\n`;
+    await writeFile(credsPath, credsLine, { encoding: 'utf8' });
+    await chmod(credsPath, 0o600).catch((chmodErr: unknown) => {
+      getLog().debug({ err: chmodErr, credsPath }, 'process_github_creds.chmod_skipped');
+    });
+
+    // Only own `credential.helper`; user-customizable keys like user.name
+    // are intentionally not set here. If a `.gitconfig` already exists at
+    // this path (uncommon in container HOME, common on dev laptops), we
+    // overwrite — this helper is opt-in via GH_TOKEN being present, and
+    // the alternative is a credential-helper-less HOME that fails fetch.
+    const cfg = '[credential]\n\thelper = store\n';
+    await writeFile(gitconfigPath, cfg, { encoding: 'utf8' });
+    await chmod(gitconfigPath, 0o600).catch((chmodErr: unknown) => {
+      getLog().debug({ err: chmodErr, gitconfigPath }, 'process_github_creds.chmod_skipped');
+    });
+
+    getLog().info({ home }, 'process_github_creds.materialized');
+  } catch (err) {
+    getLog().warn({ err, home, credsPath }, 'process_github_creds.materialize_failed');
+  }
 }
 
 /**

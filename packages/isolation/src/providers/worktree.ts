@@ -706,7 +706,13 @@ export class WorktreeProvider implements IIsolationProvider {
 
     // Sync uses only the configured base branch (or auto-detects via getDefaultBranch).
     // request.fromBranch is the start-point for worktree creation, not a sync target.
-    const baseBranch = await this.syncWorkspaceBeforeCreate(repoPath, worktreeConfig?.baseBranch);
+    // request.gitEnv threads per-user HOME to git so the credential helper at
+    // <env.HOME>/.gitconfig is consulted for fetch auth (FIX_GH_CREDS).
+    const baseBranch = await this.syncWorkspaceBeforeCreate(
+      repoPath,
+      worktreeConfig?.baseBranch,
+      request.gitEnv
+    );
 
     const override: WorktreeBaseOverride = {
       repoLocal: resolveRepoLocalOverride(worktreeConfig?.path, repoPath),
@@ -768,7 +774,8 @@ export class WorktreeProvider implements IIsolationProvider {
    */
   private async syncWorkspaceBeforeCreate(
     repoPath: RepoPath,
-    configuredBaseBranch?: string
+    configuredBaseBranch?: string,
+    gitEnv?: NodeJS.ProcessEnv
   ): Promise<string> {
     // Surface missing source dir before git runs, so the user gets an
     // actionable message instead of a 200-char "fatal: cannot change to ..."
@@ -797,7 +804,7 @@ export class WorktreeProvider implements IIsolationProvider {
       const { branch } = await syncWorkspace(
         repoPath,
         configuredBaseBranch ? toBranchName(configuredBaseBranch) : undefined,
-        { resetAfterFetch: isManagedClone }
+        { resetAfterFetch: isManagedClone, env: gitEnv }
       );
       getLog().debug({ repoPath, branch }, 'workspace_synced');
       return branch;

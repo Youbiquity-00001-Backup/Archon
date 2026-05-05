@@ -252,7 +252,13 @@ describe('cloneRepository', () => {
   });
 
   // ── GH_TOKEN authentication ────────────────────────────────────────────
-  describe('GH_TOKEN authentication', () => {
+  describe('clone URL contains no embedded auth', () => {
+    // Auth is provided via the credential helper at $HOME/.gitconfig
+    // (per-user) or process-level $HOME/.gitconfig (PAT bootstrap from
+    // server/src/index.ts:materializeProcessGithubCredentials). Embedding
+    // ${GH_TOKEN}@ in the URL was removed because git stored it in
+    // .git/config and the embedded copy expired without ever being
+    // refreshed. See FIX_GH_CREDS.md.
     beforeEach(() => {
       process.env.GH_TOKEN = 'ghp_testtoken123';
     });
@@ -261,7 +267,7 @@ describe('cloneRepository', () => {
       delete process.env.GH_TOKEN;
     });
 
-    test('injects GH_TOKEN into HTTPS clone URL', async () => {
+    test('HTTPS GitHub clone URL is passed verbatim (no token embedded)', async () => {
       mockCreateCodebase.mockResolvedValueOnce(makeCodebase() as ReturnType<typeof makeCodebase>);
 
       await cloneRepository('https://github.com/owner/private-repo');
@@ -269,10 +275,11 @@ describe('cloneRepository', () => {
       const cloneCall = (spyExecFileAsync.mock.calls as string[][]).find(
         args => args[0] === 'git' && args[1]?.[0] === 'clone'
       );
-      expect(cloneCall?.[1]?.[1]).toContain('ghp_testtoken123@github.com');
+      expect(cloneCall?.[1]?.[1]).toBe('https://github.com/owner/private-repo');
+      expect(cloneCall?.[1]?.[1]).not.toContain('@github.com');
     });
 
-    test('does NOT inject GH_TOKEN into non-github URLs', async () => {
+    test('non-github URL is also passed verbatim', async () => {
       mockCreateCodebase.mockResolvedValueOnce(
         makeCodebase({
           name: 'owner/repo',
@@ -280,7 +287,6 @@ describe('cloneRepository', () => {
         }) as ReturnType<typeof makeCodebase>
       );
 
-      // Override getProjectSourcePath for gitlab
       await cloneRepository('https://gitlab.com/owner/repo');
 
       const cloneCall = (spyExecFileAsync.mock.calls as string[][]).find(
@@ -289,7 +295,7 @@ describe('cloneRepository', () => {
       expect(cloneCall?.[1]?.[1]).not.toContain('ghp_testtoken123');
     });
 
-    test('converts SSH to HTTPS and injects GH_TOKEN', async () => {
+    test('SSH GitHub URL is converted to clean HTTPS without token', async () => {
       mockCreateCodebase.mockResolvedValueOnce(makeCodebase() as ReturnType<typeof makeCodebase>);
 
       await cloneRepository('git@github.com:owner/repo.git');
@@ -297,7 +303,10 @@ describe('cloneRepository', () => {
       const cloneCall = (spyExecFileAsync.mock.calls as string[][]).find(
         args => args[0] === 'git' && args[1]?.[0] === 'clone'
       );
-      expect(cloneCall?.[1]?.[1]).toContain('ghp_testtoken123@github.com');
+      // ssh URL was converted to https form (existing behavior in clone.ts);
+      // no token gets embedded into the resulting URL.
+      expect(cloneCall?.[1]?.[1]).not.toContain('@github.com');
+      expect(cloneCall?.[1]?.[1]).not.toContain('ghp_testtoken123');
     });
   });
 

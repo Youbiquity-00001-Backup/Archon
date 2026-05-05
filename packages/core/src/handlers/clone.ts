@@ -272,23 +272,15 @@ export async function cloneRepository(
 
   getLog().info({ url: workingUrl, targetPath }, 'clone_started');
 
-  // Build clone command with authentication if GitHub token is available.
-  // Per-user `GH_TOKEN` from `options.env` wins over `process.env.GH_TOKEN` —
-  // the requesting user's identity is more specific than any deployment-wide
-  // fallback and prevents accidental cross-user borrowing.
-  let cloneUrl = workingUrl;
-  const ghToken = options?.env?.GH_TOKEN ?? process.env.GH_TOKEN;
-
-  if (ghToken && workingUrl.includes('github.com')) {
-    if (workingUrl.startsWith('https://github.com')) {
-      cloneUrl = workingUrl.replace('https://github.com', `https://${ghToken}@github.com`);
-    } else if (workingUrl.startsWith('http://github.com')) {
-      cloneUrl = workingUrl.replace('http://github.com', `https://${ghToken}@github.com`);
-    } else if (!workingUrl.startsWith('http')) {
-      cloneUrl = `https://${ghToken}@${workingUrl}`;
-    }
-    getLog().debug('clone_authenticated');
-  }
+  // Authentication is supplied via the per-user `HOME` set in `options.env`,
+  // which threads `<userHome>/.gitconfig` (credential.helper=store) and
+  // `<userHome>/.git-credentials` (refreshed by ensureFreshGithub) to git.
+  // Embedding `${GH_TOKEN}@github.com` into the URL was previously used as
+  // belt-and-suspenders, but it baked an expiring token into `.git/config`
+  // that no later refresh could reach — every fetch over an hour after
+  // clone failed once the GitHub App user-to-server token expired. See
+  // FIX_GH_CREDS.md for the full bug write-up.
+  const cloneUrl = workingUrl;
 
   // Remove the empty source/ directory before cloning (git clone requires non-existent target)
   try {
@@ -300,9 +292,11 @@ export async function cloneRepository(
     }
   }
 
-  // Per-user `HOME` is threaded through so any `.git-credentials` materialized
-  // by `UserCredsService` in that home dir take effect for this clone too —
-  // belt-and-suspenders alongside the in-URL token auth above.
+  // Per-user `HOME` from `options.env` lets git's credential helper find
+  // `<userHome>/.git-credentials` at clone time. When a deployment-wide PAT
+  // is set in `process.env.GH_TOKEN` and there's no per-user identity,
+  // bootstrap-time materialization at the process HOME provides the
+  // fallback (see server/src/index.ts).
   const cloneEnv = options?.env ? { ...process.env, ...options.env } : undefined;
   try {
     await execFileAsync('git', ['clone', cloneUrl, targetPath], { env: cloneEnv });

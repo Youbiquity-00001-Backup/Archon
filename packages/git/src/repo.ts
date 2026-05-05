@@ -94,15 +94,24 @@ export async function getRemoteUrl(repoPath: RepoPath): Promise<string | null> {
 export async function syncWorkspace(
   workspacePath: RepoPath,
   baseBranch?: BranchName,
-  options?: { resetAfterFetch?: boolean }
+  options?: { resetAfterFetch?: boolean; env?: NodeJS.ProcessEnv }
 ): Promise<WorkspaceSyncResult> {
   const shouldReset = options?.resetAfterFetch ?? true;
+  const env = options?.env;
   const branchToSync = baseBranch ?? (await getDefaultBranch(workspacePath));
+
+  // Strip embedded `user[:pass]@` auth from `remote.origin.url` if present.
+  // Workspaces cloned by older Archon versions baked an expiring GitHub App
+  // token into the URL; we now rely on the credential helper at HOME, which
+  // can't be consulted while the URL still carries a (now-stale) token.
+  // Idempotent — no-op when the URL is already clean. See FIX_GH_CREDS.md.
+  await normalizeOriginAuth(workspacePath, env);
 
   // Fetch from origin to ensure origin/<branchToSync> is up-to-date
   try {
     await execFileAsync('git', ['-C', workspacePath, 'fetch', 'origin', branchToSync], {
       timeout: 60000,
+      env,
     });
   } catch (error) {
     const err = error as Error;
@@ -133,7 +142,7 @@ export async function syncWorkspace(
     const { stdout } = await execFileAsync(
       'git',
       ['-C', workspacePath, 'rev-parse', '--short=8', 'HEAD'],
-      { timeout: 10000 }
+      { timeout: 10000, env }
     );
     previousHead = stdout.trim();
   } catch {
@@ -145,6 +154,7 @@ export async function syncWorkspace(
   try {
     await execFileAsync('git', ['-C', workspacePath, 'reset', '--hard', `origin/${branchToSync}`], {
       timeout: 30000,
+      env,
     });
   } catch (error) {
     const err = error as Error;
@@ -156,7 +166,7 @@ export async function syncWorkspace(
     const { stdout } = await execFileAsync(
       'git',
       ['-C', workspacePath, 'rev-parse', '--short=8', 'HEAD'],
-      { timeout: 10000 }
+      { timeout: 10000, env }
     );
     newHead = stdout.trim();
   } catch {
@@ -170,6 +180,57 @@ export async function syncWorkspace(
     newHead,
     updated: previousHead !== newHead && previousHead !== '',
   };
+}
+
+/**
+ * Strip embedded `user[:pass]@` auth from a GitHub-style URL. Leaves SSH
+ * URLs (`git@github.com:owner/repo`) and already-clean URLs unchanged.
+ *
+ *   https://ghu_xxx@github.com/o/r          → https://github.com/o/r
+ *   https://x-access-token:abc@github.com/o → https://github.com/o
+ *   https://github.com/o/r                  → https://github.com/o/r  (no-op)
+ *   git@github.com:o/r.git                  → git@github.com:o/r.git  (no-op)
+ *
+ * Exported for unit testing.
+ */
+export function stripEmbeddedAuth(url: string): string {
+  // Only matches `https?://<auth>@<host>...` shape. The inner `[^@/]+@`
+  // character class refuses to match a `@` inside a path segment as auth.
+  return url.replace(/^(https?:\/\/)[^@/]+@/, '$1');
+}
+
+/**
+ * Idempotent migration: if `remote.origin.url` carries embedded auth, strip
+ * it via `git remote set-url`. Non-fatal — if reading or writing the URL
+ * fails, log and let the subsequent fetch surface the real error.
+ */
+async function normalizeOriginAuth(
+  workspacePath: RepoPath,
+  env: NodeJS.ProcessEnv | undefined
+): Promise<void> {
+  let current: string;
+  try {
+    const { stdout } = await execFileAsync(
+      'git',
+      ['-C', workspacePath, 'config', '--get', 'remote.origin.url'],
+      { timeout: 5000, env }
+    );
+    current = stdout.trim();
+  } catch {
+    // No origin set, or non-git repo — let the caller's fetch surface the real error.
+    return;
+  }
+  const stripped = stripEmbeddedAuth(current);
+  if (!stripped || stripped === current) return;
+  try {
+    await execFileAsync('git', ['-C', workspacePath, 'remote', 'set-url', 'origin', stripped], {
+      timeout: 5000,
+      env,
+    });
+  } catch {
+    // Non-fatal: a fetch failure downstream gives the user a clearer error
+    // than this best-effort normalization would.
+  }
 }
 
 /**

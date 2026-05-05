@@ -43,6 +43,20 @@ interface IsolationRequestBase {
   canonicalRepoPath: RepoPath;
 
   description?: string;
+
+  /**
+   * Per-user environment overlay for git operations during isolation
+   * setup (clone, fetch, set-url). Threaded down to git subprocesses so
+   * the credential helper at `<env.HOME>/.gitconfig` can find
+   * `<env.HOME>/.git-credentials`. When undefined, git inherits the
+   * server process env — which carries either the deployment-wide
+   * `process.env.GH_TOKEN` PAT or no auth (and fails accordingly).
+   *
+   * Set this when invoking isolation from an authenticated context where
+   * a fresh GitHub token has been materialized for the user (typically
+   * the orchestrator after `ensureFreshGithub`). See FIX_GH_CREDS.md.
+   */
+  gitEnv?: NodeJS.ProcessEnv;
 }
 
 export interface IssueIsolationRequest extends IsolationRequestBase {
@@ -217,6 +231,15 @@ export interface IsolationHints {
 
   // Adoption hints
   suggestedBranch?: string;
+
+  /**
+   * Per-user environment overlay (HOME + GH_TOKEN + ...) for git operations
+   * during worktree setup. Forwarded to `IsolationRequest.gitEnv` in
+   * `createNewEnvironment`. Set by the orchestrator after
+   * `ensureFreshGithub` so the credential helper sees a current token.
+   * See FIX_GH_CREDS.md.
+   */
+  gitEnv?: NodeJS.ProcessEnv;
 }
 
 export type IsolationBlockReason = 'creation_failed';

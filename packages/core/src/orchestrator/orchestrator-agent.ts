@@ -270,6 +270,13 @@ async function dispatchOrchestratorWorkflow(
     codebase_id: codebase.id,
   });
 
+  // Build per-user env overlay once for this dispatch — same overlay is
+  // forwarded to isolation resolution (so git's credential helper finds
+  // the user's `.git-credentials` during clone/fetch — see FIX_GH_CREDS.md),
+  // to all three foreground workflow branches, and to the background-worker
+  // dispatch below. Refreshes a near-expiry GitHub token as a side effect.
+  const userEnvOverlay = await buildUserEnvOverlayForWorkflow(platformUserId);
+
   // Validate and resolve isolation.
   // A workflow with `worktree.enabled: false` short-circuits the resolver entirely
   // and runs in the live checkout — no worktree creation, no env row. This is the
@@ -284,12 +291,15 @@ async function dispatchOrchestratorWorkflow(
     cwd = codebase.default_cwd;
   } else {
     try {
+      const hintsWithGitEnv = userEnvOverlay
+        ? { ...(isolationHints ?? {}), gitEnv: { ...process.env, ...userEnvOverlay } }
+        : isolationHints;
       const result = await validateAndResolveIsolation(
         { ...conversation, codebase_id: codebase.id },
         codebase,
         platform,
         conversationId,
-        isolationHints
+        hintsWithGitEnv
       );
       cwd = result.cwd;
     } catch (error) {
@@ -308,11 +318,6 @@ async function dispatchOrchestratorWorkflow(
       throw error;
     }
   }
-
-  // Build per-user env overlay once for this dispatch — same overlay is
-  // forwarded to all three foreground branches and the background-worker
-  // dispatch below. Refreshes a near-expiry GitHub token as a side effect.
-  const userEnvOverlay = await buildUserEnvOverlayForWorkflow(platformUserId);
 
   // Dispatch workflow
   if (platform.getPlatformType() === 'web') {

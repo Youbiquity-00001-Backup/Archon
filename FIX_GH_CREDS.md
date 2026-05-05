@@ -1,8 +1,10 @@
 # FIX_GH_CREDS — Stop embedding short-lived GitHub tokens in workspace remote URLs
 
-> **Status:** plan, not implemented. This document is a handoff — any engineer (or future Claude session) should be able to execute it cold.
+> **Status:** **implemented** (steps 1, 2, 3, 4, 6, 7). Step 5 partial — orchestrator
+> isolation path threads `gitEnv` end-to-end; pre-flight `syncWorkspace` in
+> `discoverAllWorkflows` still uses default env (non-fatal call, deferred).
 > **Scope:** the soft-fork at `Youbiquity-00001-Backup/Archon` (branch `main` / `youbiquity`).
-> **Estimated effort:** 1–2 days. **Confidence on first PR landing clean: 75%.**
+> Original estimate: 1–2 days. Actual: ~2 hours, validated live against archon-dev via ECS Exec.
 
 ---
 

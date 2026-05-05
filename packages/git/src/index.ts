@@ -48,4 +48,5 @@ export {
   cloneRepository,
   syncRepository,
   addSafeDirectory,
+  stripEmbeddedAuth,
 } from './repo';

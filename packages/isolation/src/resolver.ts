@@ -433,12 +433,17 @@ export class IsolationResolver {
     canonicalPath: RepoPath,
     platformType: string
   ): Promise<IsolationResolution> {
-    // Construct request based on workflow type
+    // Construct request based on workflow type. `gitEnv` flows from the
+    // caller-supplied hints down to git subprocesses (clone, fetch,
+    // remote set-url) so the user's per-user HOME — and the credential
+    // helper inside it — is consulted instead of the server process env.
+    // See FIX_GH_CREDS.md.
     const baseRequest = {
       codebaseId: codebase.id,
       codebaseName: codebase.name,
       canonicalRepoPath: canonicalPath,
       identifier: workflowId,
+      gitEnv: hints?.gitEnv,
     };
 
     let isolationRequest: IsolationRequest;

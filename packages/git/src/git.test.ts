@@ -1319,6 +1319,28 @@ branch refs/heads/feature/auth
   // repo.ts
   // ==========================================================================
 
+  describe('stripEmbeddedAuth', () => {
+    test.each([
+      // Embedded-token cases — strip auth, return clean URL
+      ['https://ghu_x@github.com/o/r', 'https://github.com/o/r'],
+      ['https://ghp_abc123@github.com/o/r', 'https://github.com/o/r'],
+      ['https://x-access-token:abc@github.com/o/r', 'https://github.com/o/r'],
+      ['https://user:pass@github.com/o/r.git', 'https://github.com/o/r.git'],
+      ['http://gho_legacy@github.com/o/r', 'http://github.com/o/r'],
+      // Already-clean URLs — no-op (idempotent)
+      ['https://github.com/o/r', 'https://github.com/o/r'],
+      ['https://github.com/o/r.git', 'https://github.com/o/r.git'],
+      ['https://gitlab.com/o/r', 'https://gitlab.com/o/r'],
+      // SSH URLs — left alone (no `https?://` prefix)
+      ['git@github.com:o/r.git', 'git@github.com:o/r.git'],
+      ['ssh://git@github.com/o/r', 'ssh://git@github.com/o/r'],
+      // False-positive sanity check: `@` in path, not auth
+      ['https://github.com/o/r-with@in-name', 'https://github.com/o/r-with@in-name'],
+    ])('strips %s -> %s', (input, expected) => {
+      expect(git.stripEmbeddedAuth(input)).toBe(expected);
+    });
+  });
+
   describe('syncWorkspace', () => {
     let execSpy: Mock<typeof git.execFileAsync>;
     let getDefaultBranchSpy: Mock<typeof git.getDefaultBranch>;
