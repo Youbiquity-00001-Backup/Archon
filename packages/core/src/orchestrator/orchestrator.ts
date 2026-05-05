@@ -292,12 +292,23 @@ export async function dispatchBackgroundWorkflow(
         `Cannot dispatch workflow "${workflow.name}": codebase ${ctx.codebaseId} not found`
       );
     }
+    // ctx.userEnvOverlay carries the per-user HOME + GH_TOKEN built by the
+    // dispatcher's `buildUserEnvOverlayForWorkflow`. Threading it into
+    // `hints.gitEnv` lets the worktree provider's syncWorkspace consult
+    // the credential helper at <userHome>/.gitconfig — without it, this
+    // background path silently used the server's default HOME and fetches
+    // failed with "could not read Username for 'https://github.com'".
+    // See FIX_GH_CREDS.md.
     const result = await validateAndResolveIsolation(
       workerConv,
       codebase,
       ctx.platform,
       workerPlatformId,
-      { workflowType: 'thread', workflowId: workerPlatformId }
+      {
+        workflowType: 'thread',
+        workflowId: workerPlatformId,
+        gitEnv: ctx.userEnvOverlay ? { ...process.env, ...ctx.userEnvOverlay } : undefined,
+      }
     );
     workerCwd = result.cwd;
     await db.updateConversation(workerConv.id, { cwd: workerCwd }).catch((e: unknown) => {
