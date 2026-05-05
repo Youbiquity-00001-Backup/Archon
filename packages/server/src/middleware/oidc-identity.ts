@@ -90,7 +90,20 @@ export function createOidcMiddleware(config: OidcMiddlewareConfig): MiddlewareHa
       return;
     }
 
+    // Internal calls from inside the container (e.g. workflow scripts hitting
+    // /api over localhost) bypass ALB and so never carry x-forwarded-for. ALB
+    // always sets x-forwarded-for on public requests, so its absence proves
+    // the call did not transit the internet-facing load balancer. We require
+    // BOTH headers be absent — a request with x-amzn-oidc-data should always
+    // be JWT-validated, never silently bypassed. Internal callers send no
+    // identity headers at all; getIdentity() returns undefined and downstream
+    // handlers see an anonymous request.
     const jwt = c.req.header('x-amzn-oidc-data');
+    if (!c.req.header('x-forwarded-for') && !jwt) {
+      getLog().debug({ path: c.req.path }, 'auth.oidc.internal_call_bypass');
+      await next();
+      return;
+    }
     if (!jwt) {
       // Distinct from the "key not in allowlist" case so operators can grep
       // the log to distinguish "ALB didn't attach a JWT" (config drift) from

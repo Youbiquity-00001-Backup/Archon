@@ -166,11 +166,28 @@ describe('createOidcMiddleware', () => {
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
 
-  test('401 when the JWT header is missing entirely', async () => {
+  test('401 when JWT is missing on a public (X-Forwarded-For) request', async () => {
     const fetcher = mock(async () => '');
     const app = newApp({ fetcher });
-    const res = await app.request('/api/me');
+    // X-Forwarded-For is what ALB always adds — its presence with no JWT
+    // means "request transited the load balancer but lacks identity", which
+    // is the operator-misconfig case we want to surface as 401.
+    const res = await app.request('/api/me', {
+      headers: { 'x-forwarded-for': '203.0.113.7' },
+    });
     expect(res.status).toBe(401);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  test('internal call (no XFF, no JWT) bypasses auth and reaches handler', async () => {
+    const fetcher = mock(async () => '');
+    const app = newApp({ fetcher });
+    // No headers at all — emulates a workflow script calling localhost:3090
+    // from inside the container. getIdentity() returns undefined (anonymous).
+    const res = await app.request('/api/me');
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { identity: unknown };
+    expect(body.identity).toBeUndefined();
     expect(fetcher).not.toHaveBeenCalled();
   });
 
