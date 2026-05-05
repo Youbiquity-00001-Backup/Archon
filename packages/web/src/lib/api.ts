@@ -398,6 +398,19 @@ export async function getWorkflowRun(
   return fetchJSON(`/api/workflows/runs/${encodeURIComponent(runId)}`);
 }
 
+export interface ArtifactListEntry {
+  path: string;
+  size: number;
+  modifiedAt: string;
+}
+
+export async function listArtifacts(runId: string): Promise<ArtifactListEntry[]> {
+  const result = await fetchJSON<{ artifacts: ArtifactListEntry[] }>(
+    `/api/artifacts/${encodeURIComponent(runId)}`
+  );
+  return result.artifacts;
+}
+
 export async function getWorkflowRunByWorker(
   workerPlatformId: string
 ): Promise<{ run: WorkflowRunResponse } | null> {

@@ -12,7 +12,13 @@ import { ChatInterface } from '@/components/chat/ChatInterface';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { ResizablePanelGroup, ResizablePanel, ResizableHandle } from '@/components/ui/resizable';
 import { useWorkflowStore } from '@/stores/workflow-store';
-import { getWorkflowRun, getWorkflowRunByWorker, getCodebase, getWorkflow } from '@/lib/api';
+import {
+  getWorkflowRun,
+  getWorkflowRunByWorker,
+  getCodebase,
+  getWorkflow,
+  listArtifacts,
+} from '@/lib/api';
 import { ensureUtc, formatDurationMs } from '@/lib/format';
 import { selectInitialNode } from '@/lib/select-initial-node';
 import type {
@@ -567,6 +573,24 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
 
   const isRunning = workflow.status === 'running' || workflow.status === 'pending';
 
+  // Filesystem listing fallback: surface files written to $ARTIFACTS_DIR even when
+  // workflow nodes never emitted `workflow_artifact` events (the common case today).
+  const shouldFetchArtifactListing = !isRunning && workflow.artifacts.length === 0;
+  const { data: listingArtifacts } = useQuery({
+    queryKey: ['artifactListing', runId],
+    queryFn: () => listArtifacts(runId),
+    enabled: shouldFetchArtifactListing,
+    staleTime: Infinity,
+  });
+  const displayArtifacts =
+    workflow.artifacts.length > 0
+      ? workflow.artifacts
+      : (listingArtifacts ?? []).map(entry => ({
+          type: 'file_created' as ArtifactType,
+          label: entry.path.split('/').pop() ?? entry.path,
+          path: entry.path,
+        }));
+
   // Pick the platform ID for logs: worker takes precedence over conversation.
   const logsPlatformId = workerPlatformId ?? conversationPlatformId;
 
@@ -592,9 +616,9 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
           <StepLogs runId={runId} lines={stepLogLines} />
         )}
       </div>
-      {!isRunning && workflow.artifacts.length > 0 && (
+      {!isRunning && displayArtifacts.length > 0 && (
         <div className="border-t border-border p-3">
-          <ArtifactSummary artifacts={workflow.artifacts} runId={runId} />
+          <ArtifactSummary artifacts={displayArtifacts} runId={runId} />
         </div>
       )}
     </div>

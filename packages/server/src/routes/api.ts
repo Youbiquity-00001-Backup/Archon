@@ -6,7 +6,7 @@ import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi';
 import { streamSSE } from 'hono/streaming';
 import { cors } from 'hono/cors';
 import type { WebAdapter } from '../adapters/web';
-import { rm, readFile, writeFile, unlink, mkdir } from 'fs/promises';
+import { rm, readFile, readdir, stat, writeFile, unlink, mkdir } from 'fs/promises';
 import { readFileSync } from 'fs';
 import { normalize, join, sep, basename } from 'path';
 import { randomUUID } from 'crypto';
@@ -91,6 +91,7 @@ import {
   workflowRunsQuerySchema,
   approveWorkflowRunBodySchema,
   rejectWorkflowRunBodySchema,
+  artifactListResponseSchema,
 } from './schemas/workflow.schemas';
 import {
   conversationListResponseSchema,
@@ -253,6 +254,24 @@ const deleteWorkflowRoute = createRoute({
     },
     400: jsonError('Bad request'),
     404: jsonError('Not found'),
+    500: jsonError('Server error'),
+  },
+});
+
+const getArtifactListRoute = createRoute({
+  method: 'get',
+  path: '/api/artifacts/{runId}',
+  tags: ['Artifacts'],
+  summary: 'List files produced by a workflow run',
+  request: {
+    params: z.object({ runId: z.string() }),
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: artifactListResponseSchema } },
+      description: 'Artifact files',
+    },
+    404: jsonError('Run not found or has no artifacts'),
     500: jsonError('Server error'),
   },
 });
@@ -2613,6 +2632,65 @@ export function registerApiRoutes(
       getLog().error({ err }, 'commands.list_failed');
       return apiError(c, 500, 'Failed to list commands');
     }
+  });
+
+  // GET /api/artifacts/:runId - List files under the run's artifacts directory.
+  // Recursive walk; entries are POSIX-style relative paths.
+  // Returns 200 with `{ artifacts: [] }` when the directory does not exist (run
+  // produced no files) — distinguishes "no artifacts" from "run not found".
+  registerOpenApiRoute(getArtifactListRoute, async c => {
+    const runId = c.req.param('runId') ?? '';
+    if (!runId) {
+      return apiError(c, 400, 'Missing run ID');
+    }
+
+    let run: Awaited<ReturnType<typeof workflowDb.getWorkflowRun>>;
+    try {
+      run = await workflowDb.getWorkflowRun(runId);
+    } catch (error) {
+      getLog().error({ err: error, runId }, 'artifacts.list_run_lookup_failed');
+      return apiError(c, 500, 'Failed to look up workflow run');
+    }
+    if (!run) {
+      return apiError(c, 404, 'Workflow run not found');
+    }
+
+    const codebase = run.codebase_id ? await codebaseDb.getCodebase(run.codebase_id) : null;
+    if (!codebase?.name) {
+      return apiError(c, 404, 'Artifact not available: codebase not found');
+    }
+    const [owner, repo] = codebase.name.split('/');
+    if (!owner || !repo) {
+      return apiError(c, 404, 'Artifact not available: could not determine owner/repo');
+    }
+    const artifactDir = getRunArtifactsPath(owner, repo, runId);
+
+    let entries: string[];
+    try {
+      entries = await readdir(artifactDir, { recursive: true });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        return c.json({ artifacts: [] });
+      }
+      getLog().error({ err, runId, artifactDir }, 'artifacts.list_readdir_failed');
+      return apiError(c, 500, 'Failed to list artifacts');
+    }
+
+    const files: { path: string; size: number; modifiedAt: string }[] = [];
+    for (const entry of entries) {
+      const rel = entry.split(sep).join('/');
+      const abs = join(artifactDir, entry);
+      let st: Awaited<ReturnType<typeof stat>>;
+      try {
+        st = await stat(abs);
+      } catch {
+        continue;
+      }
+      if (!st.isFile()) continue;
+      files.push({ path: rel, size: st.size, modifiedAt: st.mtime.toISOString() });
+    }
+    files.sort((a, b) => a.path.localeCompare(b.path));
+    return c.json({ artifacts: files });
   });
 
   // GET /api/artifacts/:runId/* - Serve workflow artifact file contents

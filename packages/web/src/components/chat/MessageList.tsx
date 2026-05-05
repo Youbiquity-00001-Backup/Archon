@@ -12,7 +12,7 @@ import { WorkflowProgressCard } from './WorkflowProgressCard';
 import { ArtifactViewerModal } from '@/components/workflows/ArtifactViewerModal';
 import { useAutoScroll } from '@/hooks/useAutoScroll';
 import { useWorkflowStore } from '@/stores/workflow-store';
-import { getWorkflowRun } from '@/lib/api';
+import { getWorkflowRun, listArtifacts } from '@/lib/api';
 import { StatusIcon } from '@/components/workflows/StatusIcon';
 import { ArtifactSummary } from '@/components/workflows/ArtifactSummary';
 import { formatDurationMs, ensureUtc } from '@/lib/format';
@@ -162,7 +162,9 @@ function WorkflowResultCard({
     totalCount = terminalEvents.length;
   }
 
-  // Artifacts: prefer live store, fall back to events
+  // Artifacts: prefer live store, fall back to events, then to a filesystem listing.
+  // The filesystem listing covers the common case where workflow nodes write files
+  // to $ARTIFACTS_DIR but never emit `workflow_artifact` events — see PR notes.
   const eventArtifacts: WorkflowArtifact[] = (runData?.events ?? [])
     .filter(e => e.event_type === 'workflow_artifact')
     .map(e => {
@@ -176,7 +178,29 @@ function WorkflowResultCard({
         path: typeof d.path === 'string' ? d.path : undefined,
       };
     });
-  const artifacts = storeArtifacts.length > 0 ? storeArtifacts : eventArtifacts;
+
+  const isTerminal = status === 'completed' || status === 'failed' || status === 'cancelled';
+  const shouldFetchListing =
+    isTerminal && storeArtifacts.length === 0 && eventArtifacts.length === 0;
+  const { data: listingArtifacts } = useQuery({
+    queryKey: ['artifactListing', runId],
+    queryFn: () => listArtifacts(runId),
+    enabled: shouldFetchListing,
+    staleTime: Infinity,
+  });
+  const filesystemArtifacts: WorkflowArtifact[] = (listingArtifacts ?? []).map(entry => {
+    const label = entry.path.split('/').pop() ?? entry.path;
+    return { type: 'file_created' as ArtifactType, label, path: entry.path };
+  });
+
+  let artifacts: WorkflowArtifact[];
+  if (storeArtifacts.length > 0) {
+    artifacts = storeArtifacts;
+  } else if (eventArtifacts.length > 0) {
+    artifacts = eventArtifacts;
+  } else {
+    artifacts = filesystemArtifacts;
+  }
 
   // If API fetch failed and no live state, show degraded card with just content + link
   const fetchFailed = isError && !liveState;

@@ -228,3 +228,17 @@ export const workflowRunsQuerySchema = z.object({
   codebaseId: z.string().optional(),
   limit: z.string().optional(),
 });
+
+/** A file produced by a workflow run, listed under its $ARTIFACTS_DIR. */
+export const artifactListEntrySchema = z
+  .object({
+    path: z.string(),
+    size: z.number().int().nonnegative(),
+    modifiedAt: z.string(),
+  })
+  .openapi('ArtifactListEntry');
+
+/** GET /api/artifacts/:runId response — list of files under the run's artifacts dir. */
+export const artifactListResponseSchema = z
+  .object({ artifacts: z.array(artifactListEntrySchema) })
+  .openapi('ArtifactListResponse');
