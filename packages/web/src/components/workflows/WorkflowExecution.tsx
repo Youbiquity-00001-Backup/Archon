@@ -544,6 +544,24 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
     setNodeScrollTrigger(prev => prev + 1);
   }, []);
 
+  // Filesystem listing fallback: surface files written to $ARTIFACTS_DIR even when
+  // workflow nodes never emitted `workflow_artifact` events (the common case today).
+  // Hook must be called unconditionally — gated via `enabled` so it's a no-op when
+  // workflow data isn't ready yet.
+  const isTerminalForArtifacts =
+    workflow !== null &&
+    (workflow.status === 'completed' ||
+      workflow.status === 'failed' ||
+      workflow.status === 'cancelled');
+  const shouldFetchArtifactListing =
+    isTerminalForArtifacts && workflow !== null && workflow.artifacts.length === 0;
+  const { data: listingArtifacts } = useQuery({
+    queryKey: ['artifactListing', runId],
+    queryFn: () => listArtifacts(runId),
+    enabled: shouldFetchArtifactListing,
+    staleTime: Infinity,
+  });
+
   if (error) {
     return (
       <div className="flex items-center justify-center h-full text-error">
@@ -573,15 +591,8 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
 
   const isRunning = workflow.status === 'running' || workflow.status === 'pending';
 
-  // Filesystem listing fallback: surface files written to $ARTIFACTS_DIR even when
-  // workflow nodes never emitted `workflow_artifact` events (the common case today).
-  const shouldFetchArtifactListing = !isRunning && workflow.artifacts.length === 0;
-  const { data: listingArtifacts } = useQuery({
-    queryKey: ['artifactListing', runId],
-    queryFn: () => listArtifacts(runId),
-    enabled: shouldFetchArtifactListing,
-    staleTime: Infinity,
-  });
+  // Use event/store artifacts when present, otherwise fall back to the
+  // filesystem listing fetched above.
   const displayArtifacts =
     workflow.artifacts.length > 0
       ? workflow.artifacts
