@@ -94,13 +94,29 @@ export function createOidcMiddleware(config: OidcMiddlewareConfig): MiddlewareHa
     // /api over localhost) bypass ALB and so never carry x-forwarded-for. ALB
     // always sets x-forwarded-for on public requests, so its absence proves
     // the call did not transit the internet-facing load balancer. We require
-    // BOTH headers be absent — a request with x-amzn-oidc-data should always
-    // be JWT-validated, never silently bypassed. Internal callers send no
-    // identity headers at all; getIdentity() returns undefined and downstream
-    // handlers see an anonymous request.
+    // BOTH ALB headers be absent — a request with x-amzn-oidc-data should
+    // always be JWT-validated, never silently bypassed.
+    //
+    // Internal callers MAY include `x-archon-internal-user` to claim an
+    // identity (so child workflows the call dispatches inherit a per-user
+    // env overlay). The header is trusted only on this internal path —
+    // a request with x-forwarded-for set hits the JWT branch below and
+    // this header is ignored. Single-tenant container, only our own code
+    // can set it; trust scope is the same as the IAM identity already
+    // running in the task.
     const jwt = c.req.header('x-amzn-oidc-data');
     if (!c.req.header('x-forwarded-for') && !jwt) {
-      getLog().debug({ path: c.req.path }, 'auth.oidc.internal_call_bypass');
+      const internalUser = c.req.header('x-archon-internal-user');
+      if (internalUser) {
+        const identity: OidcIdentity = { slackUserId: internalUser };
+        c.set('identity', identity);
+        getLog().debug(
+          { path: c.req.path, slackUserIdMasked: maskUid(internalUser) },
+          'auth.oidc.internal_call_with_user'
+        );
+      } else {
+        getLog().debug({ path: c.req.path }, 'auth.oidc.internal_call_bypass');
+      }
       await next();
       return;
     }

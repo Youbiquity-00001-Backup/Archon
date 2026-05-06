@@ -191,6 +191,36 @@ describe('createOidcMiddleware', () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  test('internal call with x-archon-internal-user attaches that identity', async () => {
+    const fetcher = mock(async () => '');
+    const app = newApp({ fetcher });
+    // No XFF, no JWT — internal path. The header lets the internal caller
+    // (e.g. execute-dag.ts) propagate the parent run's user identity so
+    // child workflows it dispatches inherit a userEnvOverlay.
+    const res = await app.request('/api/me', {
+      headers: { 'x-archon-internal-user': 'U_GOOD' },
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { identity: { slackUserId: string } };
+    expect(body.identity.slackUserId).toBe('U_GOOD');
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  test('public call with x-archon-internal-user is ignored — JWT path runs', async () => {
+    const fetcher = mock(async () => '');
+    const app = newApp({ fetcher });
+    // XFF present means this transited ALB; the internal-user header is
+    // attacker-spoofable on this path and must NOT take effect. The
+    // request hits the JWT-required branch instead.
+    const res = await app.request('/api/me', {
+      headers: {
+        'x-forwarded-for': '203.0.113.7',
+        'x-archon-internal-user': 'U_GOOD',
+      },
+    });
+    expect(res.status).toBe(401);
+  });
+
   test('401 on malformed JWT (not 3 segments)', async () => {
     const fetcher = mock(async () => '');
     const app = newApp({ fetcher });
