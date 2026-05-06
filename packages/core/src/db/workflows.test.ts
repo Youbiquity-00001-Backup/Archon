@@ -669,6 +669,20 @@ describe('workflows database', () => {
 
       expect(result).toEqual([mockWorkflowRun]);
     });
+
+    test('conversationId matches conversation_id OR parent_conversation_id', async () => {
+      // Background-dispatched runs are stored with conversation_id =
+      // workerConv.id and parent_conversation_id = caller's conv. Polling by
+      // the caller's UUID must match those rows via parent_conversation_id —
+      // otherwise execute-dag-style polling never sees the runs it spawned.
+      mockQuery.mockResolvedValueOnce(createQueryResult([]));
+
+      await listWorkflowRuns({ conversationId: 'conv-uuid-1' });
+
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain('(conversation_id = $1 OR parent_conversation_id = $1)');
+      expect(params[0]).toBe('conv-uuid-1');
+    });
   });
 
   describe('failOrphanedRuns', () => {

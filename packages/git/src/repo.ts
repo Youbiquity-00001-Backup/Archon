@@ -151,9 +151,14 @@ export async function syncWorkspace(
 
   // Hard-reset local working tree to match origin — only safe for Archon-managed
   // clones, never for a user's local working directory.
+  //
+  // Timeout sized for large monorepos (e.g. vscode-fork) under concurrent I/O
+  // contention. The 30s ceiling fired on a healthy 299M / 49M-pack workspace
+  // when other worktrees were being created in parallel, throwing dispatches
+  // before they could even reach dispatchBackgroundWorkflow.
   try {
     await execFileAsync('git', ['-C', workspacePath, 'reset', '--hard', `origin/${branchToSync}`], {
-      timeout: 30000,
+      timeout: 180000,
       env,
     });
   } catch (error) {

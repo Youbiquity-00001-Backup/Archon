@@ -835,8 +835,15 @@ export async function listWorkflowRuns(options?: {
   const values: unknown[] = [];
 
   if (options?.conversationId) {
+    // Match either the run's own conversation_id (foreground / direct dispatch)
+    // OR its parent_conversation_id (background dispatch — runs are stored with
+    // conversation_id = workerConv.id, parent_conversation_id = caller's conv).
+    // Without the OR, callers that poll by parent UUID (e.g. execute-dag's
+    // waitForRunId after POST /api/conversations) never see runs they spawned.
     values.push(options.conversationId);
-    whereClauses.push(`conversation_id = $${String(values.length)}`);
+    whereClauses.push(
+      `(conversation_id = $${String(values.length)} OR parent_conversation_id = $${String(values.length)})`
+    );
   }
   if (options?.status !== undefined) {
     const statuses = Array.isArray(options.status) ? options.status : [options.status];
