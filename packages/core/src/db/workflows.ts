@@ -457,7 +457,7 @@ export async function getWorkflowRunByWorkerPlatformId(
  */
 export async function updateWorkflowRun(
   id: string,
-  updates: Partial<Pick<WorkflowRun, 'status' | 'metadata'>>
+  updates: Partial<Pick<WorkflowRun, 'status' | 'metadata' | 'working_path'>>
 ): Promise<void> {
   const dialect = getDialect();
   const setClauses: string[] = [];
@@ -467,6 +467,10 @@ export async function updateWorkflowRun(
   function addParam(clause: string, value: unknown): void {
     values.push(value);
     setClauses.push(clause.replace('?', `$${values.length}`));
+  }
+
+  if (updates.working_path !== undefined) {
+    addParam('working_path = ?', updates.working_path);
   }
 
   if (updates.status !== undefined) {

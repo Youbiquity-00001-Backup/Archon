@@ -263,7 +263,8 @@ async function dispatchOrchestratorWorkflow(
   workflow: WorkflowDefinition,
   userMessage: string,
   isolationHints?: HandleMessageContext['isolationHints'],
-  platformUserId?: string
+  platformUserId?: string,
+  onWorkflowRunCreated?: (runId: string) => void
 ): Promise<void> {
   // Auto-attach project to conversation
   await db.updateConversation(conversation.id, {
@@ -381,6 +382,7 @@ async function dispatchOrchestratorWorkflow(
           availableWorkflows: [workflow],
           isolationHints,
           userEnvOverlay,
+          onWorkflowRunCreated,
         },
         workflow
       );
@@ -608,6 +610,7 @@ export async function handleMessage(
     isolationHints,
     attachedFiles,
     platformUserId,
+    onWorkflowRunCreated,
   } = context ?? {};
   try {
     getLog().debug({ conversationId }, 'orchestrator_message_received');
@@ -802,7 +805,8 @@ export async function handleMessage(
             result.workflow.definition,
             result.workflow.args ?? message,
             isolationHints,
-            platformUserId
+            platformUserId,
+            onWorkflowRunCreated
           );
         }
         return;
@@ -1559,7 +1563,8 @@ async function handleWorkflowRunCommand(
   workflow: WorkflowDefinition,
   userMessage: string,
   isolationHints?: HandleMessageContext['isolationHints'],
-  platformUserId?: string
+  platformUserId?: string,
+  onWorkflowRunCreated?: (runId: string) => void
 ): Promise<void> {
   // Check if conversation has a project
   if (conversation.codebase_id) {
@@ -1580,7 +1585,8 @@ async function handleWorkflowRunCommand(
       workflow,
       userMessage,
       isolationHints,
-      platformUserId
+      platformUserId,
+      onWorkflowRunCreated
     );
     return;
   }
@@ -1658,7 +1664,8 @@ async function handleWorkflowRunCommand(
       resolvedWorkflow,
       userMessage,
       isolationHints,
-      platformUserId
+      platformUserId,
+      onWorkflowRunCreated
     );
     return;
   }

@@ -51,6 +51,14 @@ export const createConversationResponseSchema = z
     conversationId: z.string(),
     id: z.string(),
     dispatched: z.boolean().optional(),
+    accepted: z.boolean().optional(),
+    status: z.string().optional(),
+    /**
+     * Set when the dispatched message was a `/workflow run` invocation that
+     * went through the background-worker path. Lets callers (execute-dag)
+     * skip the runs-list polling race against cold-clone latency.
+     */
+    workflowRunId: z.string().optional(),
   })
   .openapi('CreateConversationResponse');
 
@@ -104,5 +112,11 @@ export const dispatchResponseSchema = z
   .object({
     accepted: z.boolean(),
     status: z.string(),
+    /**
+     * Set when the dispatched message was a `/workflow run` invocation that
+     * went through the background-worker path. Lets callers (execute-dag)
+     * skip the runs-list polling race against cold-clone latency.
+     */
+    workflowRunId: z.string().optional(),
   })
   .openapi('DispatchResponse');

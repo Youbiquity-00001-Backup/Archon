@@ -59,6 +59,15 @@ export interface HandleMessageContext {
    */
   readonly platformUserId?: string;
   readonly attachedFiles?: AttachedFile[];
+  /**
+   * Called once with the workflow_runs row id as soon as the dispatch path
+   * pre-creates it (before isolation work begins). Lets the HTTP layer return
+   * the run id in the dispatch response so callers like execute-dag can skip
+   * the runs-list polling race. Only fires for explicit `/workflow run` paths
+   * that go through dispatchBackgroundWorkflow; foreground/interactive
+   * dispatches and AI-routed workflows do not invoke this callback.
+   */
+  readonly onWorkflowRunCreated?: (runId: string) => void;
 }
 
 export interface Codebase {

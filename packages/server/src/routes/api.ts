@@ -1023,9 +1023,29 @@ export function registerApiRoutes(
   async function dispatchToOrchestrator(
     conversationId: string,
     message: string,
-    extraContext?: Omit<HandleMessageContext, 'isolationHints'>,
+    extraContext?: Omit<HandleMessageContext, 'isolationHints' | 'onWorkflowRunCreated'>,
     filesToCleanup?: { files: AttachedFile[]; uploadDir: string }
-  ): Promise<{ accepted: boolean; status: string }> {
+  ): Promise<{ accepted: boolean; status: string; workflowRunId?: string }> {
+    // Capture the workflow_runs row id as soon as dispatchBackgroundWorkflow
+    // INSERTs it (before isolation), so the HTTP response can return it.
+    // The orchestrator calls this callback at most once. The race below
+    // bounds how long we wait for it before returning without an id.
+    //
+    // Only the deterministic `/workflow run` path goes through
+    // dispatchBackgroundWorkflow with the callback wired through; everything
+    // else resolves immediately so the POST isn't taxed by the race timeout.
+    const isWorkflowRunInvocation = /^\/workflow\s+run\b/i.test(message.trimStart());
+    let resolveRunId!: (id: string | undefined) => void;
+    const runIdPromise = new Promise<string | undefined>(r => {
+      resolveRunId = r;
+    });
+    if (!isWorkflowRunInvocation) {
+      resolveRunId(undefined);
+    }
+    const onWorkflowRunCreated = (id: string): void => {
+      resolveRunId(id);
+    };
+
     const result = await lockManager.acquireLock(conversationId, async () => {
       // Emit lock:true at handler start so the UI knows processing has begun.
       // Fire-and-forget — if no SSE stream is connected yet, the event is buffered.
@@ -1034,6 +1054,7 @@ export function registerApiRoutes(
         await handleMessage(webAdapter, conversationId, message, {
           isolationHints: { workflowType: 'thread', workflowId: conversationId },
           ...extraContext,
+          onWorkflowRunCreated,
         });
       } catch (error) {
         getLog().error({ err: error, conversationId }, 'handle_message_failed');
@@ -1051,6 +1072,11 @@ export function registerApiRoutes(
           getLog().error({ err: sseError, conversationId }, 'sse_error_emit_failed');
         }
       } finally {
+        // Safety net: ensure runIdPromise always resolves so the race below
+        // can never wait forever even if onWorkflowRunCreated was never called
+        // (non-workflow message, AI-routed workflow, foreground/interactive
+        // dispatch, or pre-create INSERT failure).
+        resolveRunId(undefined);
         await webAdapter.emitLockEvent(conversationId, false);
         // Clean up uploaded files AFTER handleMessage completes so the AI subprocess
         // has had a chance to read them. Doing this in the HTTP handler's finally block
@@ -1088,7 +1114,23 @@ export function registerApiRoutes(
       webAdapter.emitLockEvent(conversationId, true);
     }
 
-    return { accepted: true, status: result.status };
+    // Race the runId callback against a short bounded timeout. Workflow
+    // dispatch INSERTs are sub-100ms in practice (single DB write before
+    // isolation begins). The 2s ceiling covers cold startup or a saturated
+    // event loop while keeping non-workflow messages snappy — those will
+    // see resolveRunId(undefined) fire from the lock callback's finally
+    // and resolve immediately.
+    const RUN_ID_DISCOVERY_TIMEOUT_MS = 2000;
+    const workflowRunId = await Promise.race([
+      runIdPromise,
+      new Promise<undefined>(r => {
+        setTimeout(() => {
+          r(undefined);
+        }, RUN_ID_DISCOVERY_TIMEOUT_MS);
+      }),
+    ]);
+
+    return { accepted: true, status: result.status, workflowRunId };
   }
 
   /**

@@ -254,6 +254,13 @@ export interface WorkflowRoutingContext {
    * no platform user identity (CLI, GitHub webhook before identity resolves).
    */
   readonly userEnvOverlay?: Record<string, string>;
+  /**
+   * Called once with the pre-created workflow_runs row id, before isolation
+   * resolves. The HTTP layer races this against a short timeout to surface
+   * the id in the dispatch response so polling-based callers (execute-dag)
+   * don't race the cold-clone latency window.
+   */
+  readonly onWorkflowRunCreated?: (runId: string) => void;
 }
 
 /**
@@ -282,47 +289,111 @@ export async function dispatchBackgroundWorkflow(
     hidden: true,
   });
 
-  // 3. Resolve isolation for this worker (each background workflow gets its own worktree).
-  // Isolation failure is fatal — never run a workflow in a shared/parent worktree.
-  let workerCwd: string;
-  if (ctx.codebaseId) {
-    const codebase = await getCodebase(ctx.codebaseId);
-    if (!codebase) {
-      throw new Error(
-        `Cannot dispatch workflow "${workflow.name}": codebase ${ctx.codebaseId} not found`
-      );
-    }
-    // ctx.userEnvOverlay carries the per-user HOME + GH_TOKEN built by the
-    // dispatcher's `buildUserEnvOverlayForWorkflow`. Threading it into
-    // `hints.gitEnv` lets the worktree provider's syncWorkspace consult
-    // the credential helper at <userHome>/.gitconfig — without it, this
-    // background path silently used the server's default HOME and fetches
-    // failed with "could not read Username for 'https://github.com'".
-    // See FIX_GH_CREDS.md.
-    const result = await validateAndResolveIsolation(
-      workerConv,
-      codebase,
-      ctx.platform,
-      workerPlatformId,
-      {
-        workflowType: 'thread',
-        workflowId: workerPlatformId,
-        gitEnv: ctx.userEnvOverlay ? { ...process.env, ...ctx.userEnvOverlay } : undefined,
-      }
-    );
-    workerCwd = result.cwd;
-    await db.updateConversation(workerConv.id, { cwd: workerCwd }).catch((e: unknown) => {
-      getLog().warn(
-        { err: toError(e), workerPlatformId },
-        'orchestrator.worker_cwd_persist_failed'
-      );
+  // 3. Pre-create workflow run row BEFORE isolation work starts.
+  //
+  // Isolation on a cold workspace (e.g. a multi-GB repo first invocation)
+  // can take >90s — longer than the 90s polling deadline that
+  // execute-dag waits for the row to materialize. Inserting here, before
+  // the worktree fetch/sync, makes the row queryable in ms and lets the
+  // HTTP dispatch response return the id synchronously. `working_path`
+  // is filled in once isolation resolves below.
+  //
+  // The row's lock-token semantics (deduping concurrent dispatches by
+  // working_path) only kick in once working_path is set — until then the
+  // row is just a queued claim on this workerConv.
+  const workflowDeps = createWorkflowDeps();
+  let preCreatedRun: Awaited<ReturnType<typeof workflowDeps.store.createWorkflowRun>> | undefined;
+  try {
+    preCreatedRun = await workflowDeps.store.createWorkflowRun({
+      workflow_name: workflow.name,
+      conversation_id: workerConv.id,
+      codebase_id: ctx.codebaseId,
+      user_message: ctx.originalMessage,
+      // working_path intentionally unset — patched after isolation resolves
+      metadata: ctx.issueContext ? { github_context: ctx.issueContext } : {},
+      parent_conversation_id: ctx.conversationDbId,
     });
-  } else {
-    // No codebase — run in parent's cwd (no isolation needed for non-repo workflows)
-    workerCwd = ctx.cwd;
+    ctx.onWorkflowRunCreated?.(preCreatedRun.id);
+  } catch (error) {
+    const err = error as Error;
+    getLog().error({ err, workflowName: workflow.name }, 'pre_create_workflow_run_failed');
+    // Non-fatal: executeWorkflow will create its own row as fallback. The
+    // dispatch response then surfaces no runId; callers fall back to polling.
   }
 
-  // 4. Notify parent chat that workflow is dispatching
+  // 4. Resolve isolation for this worker (each background workflow gets its own worktree).
+  // Isolation failure is fatal — never run a workflow in a shared/parent worktree.
+  let workerCwd: string;
+  try {
+    if (ctx.codebaseId) {
+      const codebase = await getCodebase(ctx.codebaseId);
+      if (!codebase) {
+        throw new Error(
+          `Cannot dispatch workflow "${workflow.name}": codebase ${ctx.codebaseId} not found`
+        );
+      }
+      // ctx.userEnvOverlay carries the per-user HOME + GH_TOKEN built by the
+      // dispatcher's `buildUserEnvOverlayForWorkflow`. Threading it into
+      // `hints.gitEnv` lets the worktree provider's syncWorkspace consult
+      // the credential helper at <userHome>/.gitconfig — without it, this
+      // background path silently used the server's default HOME and fetches
+      // failed with "could not read Username for 'https://github.com'".
+      // See FIX_GH_CREDS.md.
+      const result = await validateAndResolveIsolation(
+        workerConv,
+        codebase,
+        ctx.platform,
+        workerPlatformId,
+        {
+          workflowType: 'thread',
+          workflowId: workerPlatformId,
+          gitEnv: ctx.userEnvOverlay ? { ...process.env, ...ctx.userEnvOverlay } : undefined,
+        }
+      );
+      workerCwd = result.cwd;
+      await db.updateConversation(workerConv.id, { cwd: workerCwd }).catch((e: unknown) => {
+        getLog().warn(
+          { err: toError(e), workerPlatformId },
+          'orchestrator.worker_cwd_persist_failed'
+        );
+      });
+    } else {
+      // No codebase — run in parent's cwd (no isolation needed for non-repo workflows)
+      workerCwd = ctx.cwd;
+    }
+  } catch (isolationError) {
+    // Isolation failed after we already inserted the run row. Mark the run
+    // failed so it doesn't sit as `pending` until the 5-min stale window,
+    // and surface the failure consistently with foreground paths.
+    if (preCreatedRun) {
+      await workflowDeps.store
+        .failWorkflowRun(preCreatedRun.id, toError(isolationError).message)
+        .catch((cleanupErr: unknown) => {
+          getLog().warn(
+            { err: toError(cleanupErr), preCreatedRunId: preCreatedRun?.id },
+            'orchestrator.background_isolation_failure_cleanup_failed'
+          );
+        });
+    }
+    throw isolationError;
+  }
+
+  // 5. Patch working_path now that isolation resolved. The row was inserted
+  // with working_path: null in step 3; setting it here completes the
+  // lock-token claim used by getActiveWorkflowRunByPath / findResumableRun.
+  if (preCreatedRun) {
+    await workflowDeps.store
+      .updateWorkflowRun(preCreatedRun.id, { working_path: workerCwd })
+      .catch((updateErr: unknown) => {
+        getLog().warn(
+          { err: toError(updateErr), preCreatedRunId: preCreatedRun?.id, workerCwd },
+          'orchestrator.background_working_path_patch_failed'
+        );
+      });
+    preCreatedRun = { ...preCreatedRun, working_path: workerCwd };
+  }
+
+  // 6. Notify parent chat that workflow is dispatching
   await ctx.platform.sendMessage(
     ctx.conversationId,
     `🚀 Dispatching workflow: **${workflow.name}** (background)`,
@@ -345,36 +416,15 @@ export async function dispatchBackgroundWorkflow(
     });
   }
 
-  // 5. Set up DB ID mapping for worker (needed for message persistence)
+  // 7. Set up DB ID mapping for worker (needed for message persistence)
   if (webAdapter) {
     webAdapter.setConversationDbId(workerPlatformId, workerConv.id);
   }
 
-  // 6. Set up event bridge (worker events → parent SSE stream)
+  // Set up event bridge (worker events → parent SSE stream)
   let unsubscribeBridge: (() => void) | undefined;
   if (webAdapter) {
     unsubscribeBridge = webAdapter.setupEventBridge(workerPlatformId, ctx.conversationId);
-  }
-
-  // 7. Pre-create workflow run row so the UI can fetch it immediately.
-  // Without this, navigating to the execution page before executeWorkflow's
-  // async setup completes would 404 (row doesn't exist yet for 1-5 seconds).
-  const workflowDeps = createWorkflowDeps();
-  let preCreatedRun: Awaited<ReturnType<typeof workflowDeps.store.createWorkflowRun>> | undefined;
-  try {
-    preCreatedRun = await workflowDeps.store.createWorkflowRun({
-      workflow_name: workflow.name,
-      conversation_id: workerConv.id,
-      codebase_id: ctx.codebaseId,
-      user_message: ctx.originalMessage,
-      working_path: workerCwd,
-      metadata: ctx.issueContext ? { github_context: ctx.issueContext } : {},
-      parent_conversation_id: ctx.conversationDbId,
-    });
-  } catch (error) {
-    const err = error as Error;
-    getLog().error({ err, workflowName: workflow.name }, 'pre_create_workflow_run_failed');
-    // Non-fatal: executeWorkflow will create its own row as fallback
   }
 
   // 8. Fire-and-forget: run workflow in background
