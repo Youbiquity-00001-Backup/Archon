@@ -278,6 +278,19 @@ async function dispatchOrchestratorWorkflow(
   // dispatch below. Refreshes a near-expiry GitHub token as a side effect.
   const userEnvOverlay = await buildUserEnvOverlayForWorkflow(platformUserId);
 
+  // Resolve dispatch path BEFORE parent isolation so we can skip the latter
+  // when its cwd would be discarded downstream:
+  //   - Resumable run → executeWorkflow uses run.working_path
+  //   - Web + non-interactive → dispatchBackgroundWorkflow re-resolves a worker cwd
+  // Resolving the parent's worktree on cold-clone repos (e.g. vscode-fork) takes
+  // minutes — longer than execute-dag's 90s polling deadline — so doing this
+  // unconditionally before pre-INSERT used to starve every spawned child task.
+  const isWeb = platform.getPlatformType() === 'web';
+  const resumableRun = isWeb
+    ? await workflowDb.findResumableRunByParentConversation(workflow.name, conversation.id)
+    : null;
+  const needsParentCwd = !resumableRun?.working_path && (workflow.interactive === true || !isWeb);
+
   // Validate and resolve isolation.
   // A workflow with `worktree.enabled: false` short-circuits the resolver entirely
   // and runs in the live checkout — no worktree creation, no env row. This is the
@@ -290,6 +303,18 @@ async function dispatchOrchestratorWorkflow(
       'workflow.worktree_disabled_by_policy'
     );
     cwd = codebase.default_cwd;
+  } else if (!needsParentCwd) {
+    // Downstream uses its own cwd; the parent value is a placeholder.
+    cwd = codebase.default_cwd;
+    getLog().info(
+      {
+        workflowName: workflow.name,
+        conversationId,
+        codebaseId: codebase.id,
+        reason: resumableRun?.working_path ? 'resumable_run_pending' : 'background_web_dispatch',
+      },
+      'workflow.parent_isolation_skipped'
+    );
   } else {
     try {
       const hintsWithGitEnv = userEnvOverlay
@@ -321,14 +346,8 @@ async function dispatchOrchestratorWorkflow(
   }
 
   // Dispatch workflow
-  if (platform.getPlatformType() === 'web') {
-    // Check for a resumable run from a prior dispatch (e.g. approved approval gate).
-    // A new background dispatch would create a new worker conversation and never find
-    // the prior run's worktree. Execute in foreground to reuse the original working path.
-    const resumableRun = await workflowDb.findResumableRunByParentConversation(
-      workflow.name,
-      conversation.id
-    );
+  if (isWeb) {
+    // resumableRun was fetched above so we can short-circuit parent isolation.
     if (resumableRun?.working_path) {
       getLog().info(
         {
