@@ -40,4 +40,14 @@ fi
 # Run setup-auth (exits after configuring Codex credentials), then exec the server
 # exec ensures bun is PID 1 and receives SIGTERM for graceful shutdown
 $RUNNER bun run setup-auth
-exec $RUNNER bun run start
+
+# Dev-only hot-reload: when ENVIRONMENT=dev, run bun with --hot so SSM-applied
+# source patches are picked up without restarting the container. Prod stays on
+# the cold-start path for predictability — module hot-reload preserves state
+# across changes (DB pools, in-flight requests), which is fine for iteration
+# but unsuitable for production where cold restarts are the contract.
+if [ "${ENVIRONMENT:-}" = "dev" ]; then
+  exec $RUNNER bun --filter @archon/server start:hot
+else
+  exec $RUNNER bun run start
+fi
