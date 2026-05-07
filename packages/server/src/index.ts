@@ -1170,34 +1170,36 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
  */
 async function materializeProcessGithubCredentials(): Promise<void> {
   const token = process.env.GH_TOKEN?.trim();
-  if (!token) {
-    getLog().info('process_github_creds.skipped_no_token');
-    return;
-  }
   const home = process.env.HOME ?? homedir();
   const credsPath = join(home, '.git-credentials');
   const gitconfigPath = join(home, '.gitconfig');
   try {
     await mkdir(home, { recursive: true });
-    // Canonical x-access-token form — same shape as UserCredsService.materialize.
-    const credsLine = `https://x-access-token:${token}@github.com\n`;
-    await writeFile(credsPath, credsLine, { encoding: 'utf8' });
-    await chmod(credsPath, 0o600).catch((chmodErr: unknown) => {
-      getLog().debug({ err: chmodErr, credsPath }, 'process_github_creds.chmod_skipped');
-    });
 
-    // Only own `credential.helper`; user-customizable keys like user.name
-    // are intentionally not set here. If a `.gitconfig` already exists at
-    // this path (uncommon in container HOME, common on dev laptops), we
-    // overwrite — this helper is opt-in via GH_TOKEN being present, and
-    // the alternative is a credential-helper-less HOME that fails fetch.
+    if (token) {
+      // Canonical x-access-token form — same shape as UserCredsService.materialize.
+      const credsLine = `https://x-access-token:${token}@github.com\n`;
+      await writeFile(credsPath, credsLine, { encoding: 'utf8' });
+      await chmod(credsPath, 0o600).catch((chmodErr: unknown) => {
+        getLog().debug({ err: chmodErr, credsPath }, 'process_github_creds.chmod_skipped');
+      });
+    }
+
+    // Always write the .gitconfig so git has a credential.helper configured
+    // at the server HOME level. Without this, git operations that run without
+    // a per-user HOME override (e.g. when userEnvOverlay is undefined) have
+    // no credential helper and attempt interactive prompting — which fails in
+    // a headless server process with "could not read Username: No such device
+    // or address". The helper is configured even when GH_TOKEN is absent
+    // because UserCredsService.materialize() may have already written a
+    // per-user .git-credentials that git would find here.
     const cfg = '[credential]\n\thelper = store\n';
     await writeFile(gitconfigPath, cfg, { encoding: 'utf8' });
     await chmod(gitconfigPath, 0o600).catch((chmodErr: unknown) => {
       getLog().debug({ err: chmodErr, gitconfigPath }, 'process_github_creds.chmod_skipped');
     });
 
-    getLog().info({ home }, 'process_github_creds.materialized');
+    getLog().info({ home, hasToken: Boolean(token) }, 'process_github_creds.materialized');
   } catch (err) {
     getLog().warn({ err, home, credsPath }, 'process_github_creds.materialize_failed');
   }
