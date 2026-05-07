@@ -559,7 +559,7 @@ export async function failWorkflowRun(id: string, error: string): Promise<void> 
     result = await pool.query(
       `UPDATE remote_agent_workflow_runs
        SET status = 'failed', completed_at = ${dialect.now()}, metadata = ${dialect.jsonMerge('metadata', 2)}
-       WHERE id = $1 AND status = 'running'`,
+       WHERE id = $1 AND status IN ('running', 'pending')`,
       [id, JSON.stringify({ error })]
     );
   } catch (dbError) {
@@ -569,7 +569,7 @@ export async function failWorkflowRun(id: string, error: string): Promise<void> 
   }
   if (result.rowCount === 0) {
     getLog().warn({ workflowRunId: id }, 'db.workflow_run_fail_no_match');
-    throw new Error(`Workflow run not found or not in running state (id: ${id})`);
+    throw new Error(`Workflow run not found or not in running/pending state (id: ${id})`);
   }
 }
 
