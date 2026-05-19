@@ -19,6 +19,9 @@ import {
   deleteCodebaseEnvVar,
   getIdentity,
   getConnections,
+  getAnthropicLabels,
+  uploadAnthropicCreds,
+  selectAnthropicLabel,
 } from '@/lib/api';
 import type {
   SafeConfigResponse,
@@ -27,6 +30,8 @@ import type {
   ProviderInfo,
   IdentityResponse,
   ConnectionsResponse,
+  AnthropicConnection,
+  AnthropicLabelsResponse,
 } from '@/lib/api';
 
 const selectClass =
@@ -262,18 +267,171 @@ function EnvVarsPanel({ codebaseId }: { codebaseId: string }): React.ReactElemen
 }
 
 /**
- * Per-user account connections (Patch 4 / Phase A.1) — Anthropic OAuth and
- * GitHub user-to-server OAuth status. Distinct from `PlatformConnectionsSection`
- * which shows deployment-level Slack/Telegram/etc configuration; this one is
- * scoped to the signed-in user's own account links.
+ * Anthropic credentials panel (Phase 5 / cloud-edge unification).
  *
- * Triggers for both kinds of (re)linking are intentionally NOT in the SPA:
- *  - Anthropic uses `/archon-creds anthropic` in Slack DM, which opens a
- *    Slack modal for pasting `~/.claude/.credentials.json` (paste-in-web
- *    is awkward UX; the modal also keeps the JSON out of slash-command
- *    text that Slack logs).
- *  - GitHub uses `/auth/github/initiate` which 302-redirects to GitHub.
- *    The "Link GitHub" button below navigates straight to that endpoint.
+ * Replaces the Slack-only paste flow. Users upload `credentials.json`
+ * directly here; the archon backend forwards to cloud-edge so cloud-edge
+ * stays the single source of truth (Anthropic rotates the refresh_token
+ * on every refresh — two stores cannot both stay valid). The label
+ * picker writes `UserPreferencesRow.archon_cred_label` via the
+ * cloud-edge HTTP API.
+ */
+function AnthropicConnectionPanel({
+  summary,
+}: {
+  summary: AnthropicConnection;
+}): React.ReactElement {
+  const queryClient = useQueryClient();
+  const { data, isLoading, error } = useQuery<AnthropicLabelsResponse | null>({
+    queryKey: ['connections', 'anthropic', 'labels'],
+    queryFn: async () => {
+      try {
+        return await getAnthropicLabels();
+      } catch (err) {
+        if ((err as Error & { status?: number }).status === 503) return null;
+        throw err;
+      }
+    },
+    staleTime: 30 * 1000,
+  });
+
+  const [pasted, setPasted] = useState('');
+  const [labelInput, setLabelInput] = useState('');
+  const [pasteError, setPasteError] = useState<string | null>(null);
+  const [pasteSuccess, setPasteSuccess] = useState<string | null>(null);
+
+  const uploadMutation = useMutation({
+    mutationFn: async (args: { credentials_json: string; label?: string }) =>
+      uploadAnthropicCreds(args),
+    onSuccess: result => {
+      setPasted('');
+      setLabelInput('');
+      setPasteError(null);
+      setPasteSuccess(result.message);
+      void queryClient.invalidateQueries({ queryKey: ['connections', 'anthropic', 'labels'] });
+      void queryClient.invalidateQueries({ queryKey: ['auth', 'connections'] });
+    },
+    onError: err => {
+      setPasteSuccess(null);
+      setPasteError(err instanceof Error ? err.message : 'Upload failed');
+    },
+  });
+
+  const selectMutation = useMutation({
+    mutationFn: async (label: string | null) => selectAnthropicLabel(label),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['connections', 'anthropic', 'labels'] });
+    },
+  });
+
+  const handleUpload = (e: React.FormEvent): void => {
+    e.preventDefault();
+    setPasteError(null);
+    setPasteSuccess(null);
+    if (!pasted.trim()) {
+      setPasteError('Paste a credentials.json blob.');
+      return;
+    }
+    uploadMutation.mutate({
+      credentials_json: pasted.trim(),
+      ...(labelInput.trim() ? { label: labelInput.trim() } : {}),
+    });
+  };
+
+  const labels = data?.labels ?? [];
+  const archonCredLabel = data?.archon_cred_label ?? null;
+
+  return (
+    <div className="space-y-3">
+      <div className="font-medium">Anthropic</div>
+
+      {summary.linked && (
+        <div className="text-xs text-muted-foreground">
+          Linked{summary.accountEmail ? ` as ${summary.accountEmail}` : ''}
+          {archonCredLabel ? ` (using label "${archonCredLabel}")` : ''}
+        </div>
+      )}
+      {!summary.linked && (
+        <div className="text-xs text-muted-foreground">
+          Not linked yet — paste your <code>~/.claude/.credentials.json</code> below.
+        </div>
+      )}
+
+      {labels.length > 0 && (
+        <div className="space-y-1">
+          <label className="text-xs text-muted-foreground">
+            Archon credentials (used across all archon repos for you)
+          </label>
+          <select
+            className={selectClass}
+            value={archonCredLabel ?? '__default__'}
+            disabled={selectMutation.isPending}
+            onChange={e => {
+              const v = e.target.value;
+              selectMutation.mutate(v === '__default__' ? null : v);
+            }}
+          >
+            <option value="__default__">Use my default Anthropic creds</option>
+            {labels.map(l => (
+              <option key={l.label} value={l.label}>
+                {l.label}
+                {l.accountEmail ? ` — ${l.accountEmail}` : ''}
+                {l.subscriptionType ? ` (${l.subscriptionType})` : ''}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
+
+      <form onSubmit={handleUpload} className="space-y-2">
+        <label className="text-xs text-muted-foreground">
+          Paste <code>~/.claude/.credentials.json</code> contents
+        </label>
+        <textarea
+          value={pasted}
+          onChange={e => setPasted(e.target.value)}
+          disabled={uploadMutation.isPending}
+          rows={6}
+          spellCheck={false}
+          autoComplete="off"
+          className="w-full rounded-md border border-border bg-surface-elevated text-text-primary p-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-ring"
+          placeholder='{"claudeAiOauth":{"accessToken":"...","refreshToken":"...","expiresAt":...}}'
+        />
+        <div className="space-y-1">
+          <label className="text-xs text-muted-foreground">
+            Label (optional — defaults to your Slack user id)
+          </label>
+          <Input
+            value={labelInput}
+            onChange={e => setLabelInput(e.target.value)}
+            disabled={uploadMutation.isPending}
+            placeholder="e.g. personal-max"
+            className="text-xs"
+          />
+        </div>
+        {pasteError && <div className="text-xs text-destructive">{pasteError}</div>}
+        {pasteSuccess && <div className="text-xs text-emerald-500">{pasteSuccess}</div>}
+        <Button type="submit" size="sm" disabled={uploadMutation.isPending}>
+          {uploadMutation.isPending ? 'Saving…' : 'Save credentials'}
+        </Button>
+      </form>
+
+      {isLoading && labels.length === 0 && (
+        <div className="text-xs text-muted-foreground">Loading labels…</div>
+      )}
+      {error && (
+        <div className="text-xs text-destructive">
+          Could not load labels: {error instanceof Error ? error.message : String(error)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Per-user account connections (Phase A.1 / Phase 5). Anthropic uses an
+ * in-page form (cloud-edge owns the chain); GitHub uses
+ * `/auth/github/initiate`; Jira still uses `/archon-creds jira` in Slack.
  */
 function AccountConnectionsSection(): React.ReactElement {
   const { data, isLoading, error } = useQuery<ConnectionsResponse | null>({
@@ -302,20 +460,7 @@ function AccountConnectionsSection(): React.ReactElement {
 
         {data && (
           <>
-            <div>
-              <div className="font-medium">Anthropic</div>
-              {data.anthropic.linked ? (
-                <div className="text-xs text-muted-foreground">
-                  Linked
-                  {data.anthropic.accountEmail ? ` as ${data.anthropic.accountEmail}` : ''}
-                </div>
-              ) : (
-                <div className="text-xs text-muted-foreground">
-                  Not linked. Run <code>/archon-creds anthropic</code> in Slack DM and paste your{' '}
-                  <code>~/.claude/.credentials.json</code> into the modal that opens.
-                </div>
-              )}
-            </div>
+            <AnthropicConnectionPanel summary={data.anthropic} />
 
             <div>
               <div className="font-medium">GitHub</div>

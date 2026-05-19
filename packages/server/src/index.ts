@@ -65,10 +65,6 @@ import {
   GitHubAdapter,
   DiscordAdapter,
   SlackAdapter,
-  anthropicCredsModal,
-  CALLBACK_ANTHROPIC_CREDS,
-  BLOCK_ANTHROPIC_CREDS_INPUT,
-  ACTION_ANTHROPIC_CREDS_VALUE,
   jiraCredsModal,
   CALLBACK_JIRA_CREDS,
   BLOCK_JIRA_BASE_URL,
@@ -103,6 +99,7 @@ import {
 import type { IPlatformAdapter } from '@archon/core';
 import { InMemoryOAuthStateStore } from './oauth-state-store';
 import { AwsSecretsManagerStore } from './services/aws-secrets-store';
+import { CloudEdgeAnthropicSource } from './services/cloud-edge-anthropic-source';
 import {
   buildGithubAuthorizeUrl,
   handleGithubOAuthCallback,
@@ -277,11 +274,33 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   // (local dev, CLI, isolated tests). Same env-driven pattern as
   // `ALB_OIDC_REGION`.
   const userCredsPrefix = process.env.USER_CREDS_SECRET_PREFIX?.trim();
+  // Unified Anthropic source (Phase 5 / cloud-edge unification). When both
+  // CLOUD_EDGE_URL and CLOUD_EDGE_BEARER_TOKEN are set, Anthropic creds are
+  // managed entirely by cloud-edge — local store reads/writes for anthropic
+  // are bypassed (github/jira continue to use the local store).
+  const cloudEdgeUrl = process.env.CLOUD_EDGE_URL?.trim();
+  const cloudEdgeBearer = process.env.CLOUD_EDGE_BEARER_TOKEN?.trim();
+  const slackTeamId = process.env.SLACK_TEAM_ID?.trim();
+  const anthropicSource =
+    cloudEdgeUrl && cloudEdgeBearer && slackTeamId
+      ? new CloudEdgeAnthropicSource({
+          cloudEdgeUrl,
+          bearerToken: cloudEdgeBearer,
+          teamId: slackTeamId,
+        })
+      : undefined;
   const userCreds = userCredsPrefix
-    ? new UserCredsService({ store: new AwsSecretsManagerStore({ prefix: userCredsPrefix }) })
-    : new UserCredsService();
+    ? new UserCredsService({
+        store: new AwsSecretsManagerStore({ prefix: userCredsPrefix }),
+        anthropicSource,
+      })
+    : new UserCredsService({ anthropicSource });
   getLog().info(
-    { backend: userCredsPrefix ? 'aws-secrets-manager' : 'in-memory', prefix: userCredsPrefix },
+    {
+      backend: userCredsPrefix ? 'aws-secrets-manager' : 'in-memory',
+      prefix: userCredsPrefix,
+      anthropicSource: anthropicSource ? 'cloud-edge' : 'store',
+    },
     'user-creds.store_configured'
   );
   await userCreds.bootstrap();
@@ -517,22 +536,16 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         const sub = (subRaw ?? '').toLowerCase();
 
         if (sub === 'anthropic') {
-          // Open the paste-credentials modal. Mirrors the cred-paste UX
-          // in llm-slack-channel-bridge: keeps the JSON out of slash-
-          // command text (which Slack logs and renders inline) and gives
-          // us inline validation via response_action: errors. Modal
-          // payloads are user-private — Slack doesn't broadcast them to
-          // the channel — so this works equally well from a DM or a
-          // channel and we no longer guard on isDM. Empty replyText so
-          // the slash command returns silently and the modal is the
-          // user-visible action.
-          const r = await slackAdapter.openView(triggerId, anthropicCredsModal());
-          if (!r.ok) {
-            return {
-              replyText: `Couldn't open the credentials modal: \`${r.error ?? 'unknown'}\``,
-            };
-          }
-          return { replyText: '' };
+          // Anthropic credential management moved to Archon Settings
+          // (Phase 5 / cloud-edge unification). Cloud-edge is now the
+          // single source of truth — managed via the Settings page or
+          // /claude-creds in Slack.
+          return {
+            replyText:
+              'Anthropic credentials are now managed from Archon Settings. ' +
+              'Open the Settings page in the web UI and use the Connections section, ' +
+              'or run `/claude-creds` in Slack (the channel-bridge bot).',
+          };
         }
 
         if (sub === 'github') {
@@ -569,74 +582,13 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
         return {
           replyText:
-            'Usage: `/archon-creds anthropic` (opens a modal), `/archon-creds github`, or `/archon-creds jira` (opens a modal).',
+            'Usage: `/archon-creds github` or `/archon-creds jira` (opens a modal). ' +
+            'For Anthropic credentials, use the Archon Settings page.',
         };
       });
 
-      // view_submission for the Connect Anthropic modal opened above.
-      // Shape-validates inline (JSON.parse + claudeAiOauth.accessToken
-      // check) so paste errors keep the modal open with a per-block
-      // error. Persistence (which also re-validates and probes the
-      // Anthropic API) runs fire-and-forget after the modal closes;
-      // the result reaches the user via DM. Matches the cred-paste
-      // flow in llm-slack-channel-bridge/packages/cloud-edge/src/
-      // interactivity.ts.
-      slackAdapter.onViewSubmission(CALLBACK_ANTHROPIC_CREDS, async (slackUserId, view) => {
-        const raw =
-          view.state.values?.[BLOCK_ANTHROPIC_CREDS_INPUT]?.[ACTION_ANTHROPIC_CREDS_VALUE]?.value ??
-          '';
-        const trimmed = raw.trim();
-        if (!trimmed) {
-          return {
-            ok: false,
-            errors: { [BLOCK_ANTHROPIC_CREDS_INPUT]: 'Paste a credentials.json blob.' },
-          };
-        }
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(trimmed);
-        } catch (err) {
-          return {
-            ok: false,
-            errors: {
-              [BLOCK_ANTHROPIC_CREDS_INPUT]: `Not valid JSON: ${(err as Error).message}`,
-            },
-          };
-        }
-        const oauth =
-          parsed && typeof parsed === 'object'
-            ? ((parsed as Record<string, unknown>).claudeAiOauth as
-                | Record<string, unknown>
-                | undefined)
-            : undefined;
-        if (!oauth || typeof oauth.accessToken !== 'string' || oauth.accessToken.length === 0) {
-          return {
-            ok: false,
-            errors: {
-              [BLOCK_ANTHROPIC_CREDS_INPUT]:
-                "JSON parsed but doesn't look like a credentials.json — expected " +
-                '`claudeAiOauth.accessToken`. Run `claude /login` to refresh.',
-            },
-          };
-        }
-
-        // Close the modal now; persist + DM the user the outcome async.
-        // upsertAnthropic re-validates and probes the Anthropic API,
-        // which can take a couple of seconds — too slow to block the
-        // view_submission ack window.
-        void (async (): Promise<void> => {
-          try {
-            const result = await userCreds.upsertAnthropic(slackUserId, trimmed);
-            await slackAdapter.sendMessage(slackUserId, result.replyText);
-          } catch (err) {
-            await slackAdapter.sendMessage(
-              slackUserId,
-              `Failed to save Anthropic credentials: ${(err as Error).message}`
-            );
-          }
-        })();
-        return { ok: true };
-      });
+      // (Connect-Anthropic Slack modal removed in Phase 5 — cloud-edge
+      // owns the chain. Upload via Archon Settings page or /claude-creds.)
 
       // view_submission for the Connect Jira modal. Inline checks (empty
       // fields, URL shape) keep the modal open with per-block errors;

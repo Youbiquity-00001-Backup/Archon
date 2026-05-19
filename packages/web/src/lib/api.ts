@@ -579,6 +579,47 @@ export async function getConnections(): Promise<ConnectionsResponse | null> {
   }
 }
 
+export interface AnthropicLabel {
+  label: string;
+  accountEmail?: string;
+  subscriptionType?: string;
+  credsVersion?: number;
+  createdAt?: string;
+}
+
+export interface AnthropicLabelsResponse {
+  archon_cred_label: string | null;
+  labels: AnthropicLabel[];
+}
+
+export async function getAnthropicLabels(): Promise<AnthropicLabelsResponse> {
+  return fetchJSON<AnthropicLabelsResponse>('/api/connections/anthropic');
+}
+
+export async function uploadAnthropicCreds(args: {
+  credentials_json: string;
+  label?: string;
+}): Promise<{ ok: true; message: string }> {
+  return fetchJSON<{ ok: true; message: string }>('/api/connections/anthropic', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(args),
+  });
+}
+
+export async function selectAnthropicLabel(
+  label: string | null
+): Promise<{ ok: true; archon_cred_label: string | null }> {
+  return fetchJSON<{ ok: true; archon_cred_label: string | null }>(
+    '/api/connections/anthropic/select',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label }),
+    }
+  );
+}
+
 // System
 export async function getHealth(): Promise<HealthResponse> {
   return fetchJSON<HealthResponse>('/api/health');

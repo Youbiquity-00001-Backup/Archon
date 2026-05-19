@@ -91,6 +91,53 @@ export interface UpsertResult {
 }
 
 /**
+ * Authoritative source for a user's current Anthropic credentials.
+ *
+ * Production wiring: an HTTP client that calls cloud-edge's
+ * `POST /internal/archon/anthropic-creds` endpoint. The endpoint owns
+ * the refresh chain end-to-end — Anthropic rotates the refresh_token
+ * on every refresh, so two stores cannot both stay valid, and
+ * cloud-edge is the single source of truth (the same store
+ * `/claude-creds` writes to in Slack).
+ */
+export interface IAnthropicCredsSource {
+  fetch(slackUserId: string): Promise<AnthropicFetchResult | null>;
+  upsert(
+    slackUserId: string,
+    rawJson: string,
+    label?: string
+  ): Promise<AnthropicUpsertResult>;
+  listLabels(slackUserId: string): Promise<AnthropicLabelsResult>;
+  setArchonCredLabel(slackUserId: string, label: string | null): Promise<void>;
+}
+
+export interface AnthropicFetchResult {
+  credsJson: string;
+  label: string;
+  accountEmail?: string;
+  subscriptionType?: string;
+  credsVersion?: number;
+}
+
+export interface AnthropicUpsertResult {
+  created: boolean;
+  label: string;
+}
+
+export interface AnthropicLabelEntry {
+  label: string;
+  accountEmail?: string;
+  subscriptionType?: string;
+  credsVersion?: number;
+  createdAt?: string;
+}
+
+export interface AnthropicLabelsResult {
+  archonCredLabel: string | null;
+  labels: AnthropicLabelEntry[];
+}
+
+/**
  * Public-safe per-user connection status, suitable for the Settings →
  * Connections SPA page. Each section is a discriminated union on `linked`
  * — when not linked, no extra fields are present, so a leaked-empty

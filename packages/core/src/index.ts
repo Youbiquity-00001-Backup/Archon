@@ -136,6 +136,11 @@ export type {
   UserCredsServiceOptions,
   AnthropicProbe,
   GithubProbe,
+  IAnthropicCredsSource,
+  AnthropicFetchResult,
+  AnthropicUpsertResult,
+  AnthropicLabelEntry,
+  AnthropicLabelsResult,
 } from './services/user-creds';
 
 // =============================================================================

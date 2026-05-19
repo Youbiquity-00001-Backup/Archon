@@ -26,6 +26,7 @@ import type {
   AnthropicCreds,
   ConnectionStatus,
   GithubCreds,
+  IAnthropicCredsSource,
   JiraCreds,
   UserCreds,
   UserEnvOverlay,
@@ -67,6 +68,13 @@ interface CacheEntry {
 export interface UserCredsServiceOptions {
   /** Pluggable secret store. Defaults to a process-local in-memory map. */
   store?: ISecretStore;
+  /**
+   * Authoritative source for Anthropic credentials. When set, this
+   * service no longer reads or writes Anthropic creds through `store`
+   * (cloud-edge owns the refresh chain end-to-end). GitHub and Jira
+   * continue to use `store`.
+   */
+  anthropicSource?: IAnthropicCredsSource;
   /**
    * Override the per-user home root. Defaults to `~/.archon/users/`.
    * Used by tests to point at a tmpdir.
@@ -258,6 +266,7 @@ const defaultGithubRefresh: GithubRefresh = async refreshToken => {
 
 export class UserCredsService {
   private readonly store: ISecretStore;
+  private readonly anthropicSource: IAnthropicCredsSource | undefined;
   private readonly usersDir: string;
   private readonly cache = new Map<string, CacheEntry>();
   private readonly anthropicProbe: AnthropicProbe;
@@ -269,12 +278,86 @@ export class UserCredsService {
 
   constructor(opts: UserCredsServiceOptions = {}) {
     this.store = opts.store ?? new InMemorySecretStore();
+    this.anthropicSource = opts.anthropicSource;
     this.usersDir = opts.usersDir ?? join(getArchonHome(), 'users');
     this.anthropicProbe = opts.anthropicProbe ?? defaultAnthropicProbe;
     this.githubProbe = opts.githubProbe ?? defaultGithubProbe;
     this.githubRefresh = opts.githubRefresh ?? defaultGithubRefresh;
     this.jiraProbe = opts.jiraProbe ?? defaultJiraProbe;
     this.clock = opts.clock ?? Date.now;
+  }
+
+  /** True iff a unified anthropic source (cloud-edge) is wired. */
+  hasAnthropicSource(): boolean {
+    return this.anthropicSource !== undefined;
+  }
+
+  /**
+   * Get a read-only handle on the configured anthropic source. Used by
+   * route handlers (Settings → /api/connections/anthropic) that call
+   * upsert / listLabels / setArchonCredLabel directly. Returns null
+   * when source mode is not configured.
+   */
+  getAnthropicSource(): IAnthropicCredsSource | null {
+    return this.anthropicSource ?? null;
+  }
+
+  /**
+   * Pre-prompt hook: pull the user's latest Anthropic credential from
+   * cloud-edge, overwrite the on-disk `.claude/.credentials.json`, and
+   * update the cached access token used by `getEnvOverlay`. No-op when
+   * no `anthropicSource` is configured (legacy / CLI / tests).
+   *
+   * Cost: 1 HTTP round-trip per workflow dispatch. Cloud-edge owns
+   * the refresh chain, so what we get here is always the freshest
+   * pair cloud-edge knows about.
+   *
+   * Returns true when the cache was updated, false when the user has
+   * no creds or the fetch failed.
+   */
+  async ensureFreshAnthropic(slackUserId: string): Promise<boolean> {
+    if (!this.anthropicSource) return false;
+    let result: { credsJson: string; label: string; accountEmail?: string } | null;
+    try {
+      result = await this.anthropicSource.fetch(slackUserId);
+    } catch (err) {
+      getLog().warn(
+        { err, slackUserId: maskUid(slackUserId) },
+        'user-creds.ensure_fresh_anthropic_fetch_failed'
+      );
+      return false;
+    }
+    if (!result) return false;
+    const parsed = parseClaudeCredentialsFile(result.credsJson);
+    if (!parsed) {
+      getLog().warn(
+        { slackUserId: maskUid(slackUserId), label: result.label },
+        'user-creds.ensure_fresh_anthropic_parse_failed'
+      );
+      return false;
+    }
+    // Materialize to disk + cache WITHOUT writing back to the local
+    // store. Cloud-edge owns the anthropic chain; archon's local
+    // store is only used for github/jira when source mode is active.
+    let prevCreds: UserCreds = {};
+    try {
+      const existingJson = await this.store.getSecret(slackUserId);
+      if (existingJson) prevCreds = JSON.parse(existingJson) as UserCreds;
+    } catch (err) {
+      getLog().debug(
+        { err, slackUserId: maskUid(slackUserId) },
+        'user-creds.ensure_fresh_anthropic_prev_read_failed'
+      );
+    }
+    const next: UserCreds = {
+      ...prevCreds,
+      anthropic: {
+        ...parsed,
+        accountEmail: result.accountEmail ?? parsed.accountEmail,
+      },
+    };
+    await this.materialize(slackUserId, next);
+    return true;
   }
 
   /**
@@ -291,7 +374,15 @@ export class UserCredsService {
       try {
         const json = await this.store.getSecret(id);
         if (!json) continue;
-        const creds = JSON.parse(json) as UserCreds;
+        const credsRaw = JSON.parse(json) as UserCreds;
+        // When the unified anthropic source is wired, the store's
+        // anthropic field is stale-at-best (cloud-edge owns the chain
+        // and rotates the refresh_token on every refresh). Strip it
+        // here so we don't materialize a known-stale token to disk at
+        // startup. ensureFreshAnthropic re-fetches at first dispatch.
+        const creds: UserCreds = this.anthropicSource
+          ? { ...credsRaw, anthropic: undefined }
+          : credsRaw;
         // Skip tombstones (`{}` written by `markRefreshChainDead`) — leaving
         // a `HOME`-only cache entry would point the spawn at an empty per-user
         // dir and break the global-auth fallback. The user re-links via
@@ -307,7 +398,7 @@ export class UserCredsService {
     }
     this.bootstrapped = true;
     getLog().info(
-      { totalIds: ids.length, materialized: materializedCount },
+      { totalIds: ids.length, materialized: materializedCount, anthropicSourceMode: this.anthropicSource !== undefined },
       'user-creds.bootstrap_completed'
     );
   }
@@ -335,11 +426,41 @@ export class UserCredsService {
   }
 
   /**
-   * Persist Anthropic creds for a user. Validates the JSON shape, probes the
-   * Anthropic API, persists to the secret store, materializes to disk, and
-   * updates the cache.
+   * Persist Anthropic creds for a user.
+   *
+   * When `anthropicSource` is wired (production), the upload is
+   * forwarded to cloud-edge so cloud-edge stays the single source of
+   * truth. The local on-disk file is then refreshed via
+   * ensureFreshAnthropic so the just-uploaded blob is visible to the
+   * next workflow run without waiting for a request.
+   *
+   * Legacy mode (no source): validates JSON, probes Anthropic, writes
+   * to the local secret store and materializes the user dir. Used by
+   * tests, CLI, and any deployment that hasn't yet migrated.
    */
-  async upsertAnthropic(slackUserId: string, rawJson: string): Promise<UpsertResult> {
+  async upsertAnthropic(slackUserId: string, rawJson: string, label?: string): Promise<UpsertResult> {
+    if (this.anthropicSource) {
+      try {
+        const result = await this.anthropicSource.upsert(slackUserId, rawJson, label);
+        await this.ensureFreshAnthropic(slackUserId);
+        return {
+          replyText: `Saved as label \`${result.label}\`.`,
+          persisted: true,
+        };
+      } catch (err) {
+        getLog().warn(
+          { err, slackUserId: maskUid(slackUserId) },
+          'user-creds.upsert_anthropic_source_failed'
+        );
+        return {
+          replyText:
+            `Could not save credentials: ${(err as Error).message ?? 'unknown error'}. ` +
+            'Try again, or contact an operator if this persists.',
+          persisted: false,
+        };
+      }
+    }
+
     const parsed = parseAnthropicJson(rawJson);
     if (!parsed.ok) {
       return { replyText: parsed.error, persisted: false };
@@ -458,44 +579,54 @@ export class UserCredsService {
    * into the cache.
    */
   async getConnectionStatus(slackUserId: string): Promise<ConnectionStatus> {
-    const json = await this.store.getSecret(slackUserId);
-    if (!json) {
-      return {
-        anthropic: { linked: false },
-        github: { linked: false },
-        jira: { linked: false },
-      };
+    // Anthropic comes from cloud-edge when source mode is on; github/jira
+    // continue to read from the local store. Each section resolves
+    // independently so a transient cloud-edge outage doesn't blank the
+    // github/jira sections (and vice versa).
+    let anthropic: ConnectionStatus['anthropic'] = { linked: false };
+    if (this.anthropicSource) {
+      try {
+        const labels = await this.anthropicSource.listLabels(slackUserId);
+        if (labels.labels.length > 0) {
+          const preferred =
+            labels.archonCredLabel
+              ? labels.labels.find(l => l.label === labels.archonCredLabel)
+              : undefined;
+          const chosen = preferred ?? labels.labels[0];
+          anthropic = { linked: true, accountEmail: chosen?.accountEmail };
+        }
+      } catch (err) {
+        getLog().warn(
+          { err, slackUserId: maskUid(slackUserId) },
+          'user-creds.connection_status_anthropic_source_failed'
+        );
+      }
     }
-    let creds: UserCreds;
+
+    let storeCreds: UserCreds | null = null;
     try {
-      creds = JSON.parse(json) as UserCreds;
+      const json = await this.store.getSecret(slackUserId);
+      if (json) storeCreds = JSON.parse(json) as UserCreds;
     } catch (err) {
-      // Stored doc is corrupt — surface as "not linked" rather than 500ing.
-      // The user can re-link via /archon-creds and we'll overwrite the
-      // bad doc on the next upsert.
       getLog().error(
         { err, slackUserId: maskUid(slackUserId) },
         'user-creds.connection_status_parse_failed'
       );
-      return {
-        anthropic: { linked: false },
-        github: { linked: false },
-        jira: { linked: false },
-      };
+    }
+    if (!this.anthropicSource && storeCreds?.anthropic) {
+      anthropic = { linked: true, accountEmail: storeCreds.anthropic.accountEmail };
     }
     return {
-      anthropic: creds.anthropic
-        ? { linked: true, accountEmail: creds.anthropic.accountEmail }
-        : { linked: false },
-      github: creds.github
+      anthropic,
+      github: storeCreds?.github
         ? {
             linked: true,
-            login: creds.github.login,
-            installationId: creds.github.installationId,
+            login: storeCreds.github.login,
+            installationId: storeCreds.github.installationId,
           }
         : { linked: false },
-      jira: creds.jira
-        ? { linked: true, baseUrl: creds.jira.baseUrl, email: creds.jira.email }
+      jira: storeCreds?.jira
+        ? { linked: true, baseUrl: storeCreds.jira.baseUrl, email: storeCreds.jira.email }
         : { linked: false },
     };
   }
@@ -570,9 +701,14 @@ export class UserCredsService {
       }
     }
 
-    const anthropicChanged = Boolean(
-      diskAnthropic && entry.anthropicAccessToken !== diskAnthropic.claudeAiOauth.accessToken
-    );
+    // When anthropic-source mode is on, the on-disk file may have been
+    // rewritten by the Claude SDK's in-process refresh — but cloud-edge
+    // owns the chain, so we don't propagate that change here. The next
+    // request's ensureFreshAnthropic will overwrite whatever cloud-edge
+    // has. Self-healing within one request cycle.
+    const anthropicChanged =
+      !this.anthropicSource &&
+      Boolean(diskAnthropic && entry.anthropicAccessToken !== diskAnthropic.claudeAiOauth.accessToken);
     const githubChanged = Boolean(diskGithubToken && entry.ghToken !== diskGithubToken);
 
     if (!anthropicChanged && !githubChanged) {
@@ -1058,6 +1194,11 @@ export type {
   JiraCreds,
   UpsertResult,
   ConnectionStatus,
+  IAnthropicCredsSource,
+  AnthropicFetchResult,
+  AnthropicUpsertResult,
+  AnthropicLabelEntry,
+  AnthropicLabelsResult,
 } from './types';
 
 // ─── Singleton accessor ─────────────────────────────────────────────────────
