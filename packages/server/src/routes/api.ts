@@ -1733,11 +1733,58 @@ export function registerApiRoutes(
   registerOpenApiRoute(addCodebaseRoute, async c => {
     const body = getValidatedBody(c, addCodebaseBodySchema);
 
+    // Thread the requesting user's GitHub creds into the clone so we
+    // can reach repos the deployment-wide PAT can't. Without this,
+    // `git clone` falls back to process.env GITHUB_TOKEN — which is
+    // scoped to a specific set of repos in the deployment-managed PAT
+    // and 403s (or "could not read Username") on anything outside.
+    //
+    // The per-user `.git-credentials` file is materialized to disk
+    // under `<usersDir>/<slackUserId>/.git-credentials` whenever the
+    // user completes /auth/github/initiate; threading their HOME +
+    // GH_TOKEN here points git's credential helper at it.
+    //
+    // `registeredBy` records the requesting user on the codebase row
+    // so the self-fallback rule (delete + token reuse) applies later.
+    const identity = getIdentity(c);
+    const userCreds = getUserCredsService();
+    let registerOptions:
+      | { registeredBy?: string | null; env?: Record<string, string> }
+      | undefined;
+    if (identity && userCreds) {
+      try {
+        await userCreds.ensureFreshGithub(identity.slackUserId);
+      } catch (err) {
+        getLog().warn(
+          { err, slackUserId: identity.slackUserId },
+          'add_codebase.ensure_fresh_github_failed'
+        );
+      }
+      const overlay = userCreds.getEnvOverlay(identity.slackUserId);
+      const env: Record<string, string> = {};
+      if (overlay) {
+        for (const [k, v] of Object.entries(overlay)) {
+          if (typeof v === 'string') env[k] = v;
+        }
+      }
+      registerOptions = {
+        registeredBy: identity.slackUserId,
+        ...(Object.keys(env).length > 0 ? { env } : {}),
+      };
+    }
+
     try {
-      // .refine() guarantees exactly one of url/path is present
+      // .refine() guarantees exactly one of url/path is present.
+      // Drop the trailing undefined when there's no identity so the
+      // signature matches the legacy call shape (existing tests assert
+      // `toHaveBeenCalledWith(url)` without a second arg).
       const result = body.url
-        ? await cloneRepository(body.url)
-        : await registerRepository(body.path ?? '');
+        ? registerOptions
+          ? await cloneRepository(body.url, registerOptions)
+          : await cloneRepository(body.url)
+        : registerOptions
+          ? await registerRepository(body.path ?? '', registerOptions)
+          : await registerRepository(body.path ?? '');
 
       // Fetch the full codebase record for a consistent response
       const codebase = await codebaseDb.getCodebase(result.codebaseId);
