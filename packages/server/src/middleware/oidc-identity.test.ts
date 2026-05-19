@@ -307,17 +307,28 @@ describe('createOidcMiddleware', () => {
     expect(res.status).toBe(403);
   });
 
-  test('an empty allowlist denies everyone, including signed identities', async () => {
+  test('an empty allowlist is open mode: any signed identity is permitted', async () => {
+    // Open mode matches the Slack chat adapter's semantic
+    // (see packages/adapters/src/chat/slack/auth.ts:isSlackUserAuthorized).
+    // ALB OIDC still enforces "must have a valid Slack JWT", so the gate
+    // here is "any workspace member" — not the public internet.
     const keys = newKeyPair();
     const fetcher = mock(async () => keys.publicKeyPem);
     const app = newApp({ fetcher, allowed: new Set() });
     const jwt = signJwt({
       kid: 'kid-1',
       privateKeyPem: keys.privateKeyPem,
-      payload: { sub: 'T-U_GOOD', exp: Math.floor(Date.now() / 1000) + 300 },
+      payload: {
+        sub: 'TABCDE-U_ANY_SLACK_USER',
+        exp: Math.floor(Date.now() / 1000) + 300,
+        email: 'fresh@example.com',
+      },
     });
     const res = await app.request('/api/me', { headers: { 'x-amzn-oidc-data': jwt } });
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { identity: { slackUserId: string; email?: string } };
+    expect(body.identity.slackUserId).toBe('U_ANY_SLACK_USER');
+    expect(body.identity.email).toBe('fresh@example.com');
   });
 
   test('OPTIONS preflight passes through without a JWT (no fetcher hit)', async () => {
