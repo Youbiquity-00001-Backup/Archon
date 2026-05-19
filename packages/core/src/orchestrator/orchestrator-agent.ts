@@ -231,10 +231,13 @@ async function buildUserEnvOverlayForWorkflow(
   if (!platformUserId) return undefined;
   const userCreds = getUserCredsService();
   if (!userCreds) return undefined;
-  // Refresh any near-expiry GitHub token before snapshotting the overlay so
-  // the workflow nodes see a fresh GH_TOKEN. ensureFreshGithub is a no-op
-  // when nothing is due — paid only when the token is actually expiring.
+  // Refresh per-user creds before snapshotting the overlay.
+  //  - GitHub: ensureFreshGithub is a no-op when nothing is due.
+  //  - Anthropic: ensureFreshAnthropic pulls from cloud-edge (the
+  //    single source of truth across archon + the channel bridge).
+  //    No-op when no anthropicSource is wired (CLI / dev).
   await userCreds.ensureFreshGithub(platformUserId);
+  await userCreds.ensureFreshAnthropic(platformUserId);
   const overlay = userCreds.getEnvOverlay(platformUserId);
   if (!overlay) return undefined;
   // UserEnvOverlay is a typed interface with optional keys (HOME, GH_TOKEN,
@@ -954,6 +957,10 @@ export async function handleMessage(
       // expiry (the common case) — the I/O cost is paid only when the
       // token is actually due.
       await userCreds.ensureFreshGithub(platformUserId);
+      // Anthropic creds come from cloud-edge in unified mode; pull the
+      // latest pair before spawn so the SDK starts with what cloud-edge
+      // knows. No-op when no anthropicSource is wired.
+      await userCreds.ensureFreshAnthropic(platformUserId);
     }
     const liveOverlay =
       platformUserId && userCreds ? (userCreds.getEnvOverlay(platformUserId) ?? null) : null;

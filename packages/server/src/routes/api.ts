@@ -914,7 +914,7 @@ export function registerApiRoutes(
 ): void {
   function apiError(
     c: Context,
-    status: 400 | 401 | 403 | 404 | 422 | 500 | 503,
+    status: 400 | 401 | 403 | 404 | 422 | 500 | 502 | 503,
     message: string,
     detail?: string
   ): Response {
@@ -1910,6 +1910,118 @@ export function registerApiRoutes(
     }
     const status = await userCreds.getConnectionStatus(identity.slackUserId);
     return c.json(status);
+  });
+
+  // -------------------------------------------------------------------------
+  // Anthropic credentials — Settings page proxy routes (Phase 5).
+  //
+  // Thin wrappers around `UserCredsService.getAnthropicSource()` so the
+  // SPA never speaks to cloud-edge directly (the bearer token stays
+  // server-side). Each route requires an OIDC identity. Cloud-edge is
+  // the single source of truth — these routes have no fallback to the
+  // local secret store, so they 503 in source-less deployments.
+  // -------------------------------------------------------------------------
+
+  app.get('/api/connections/anthropic', async c => {
+    const identity = getIdentity(c);
+    if (!identity) return apiError(c, 401, 'No OIDC identity on this request');
+    const userCreds = getUserCredsService();
+    if (!userCreds) return apiError(c, 503, 'UserCredsService not configured');
+    const source = userCreds.getAnthropicSource();
+    if (!source) return apiError(c, 503, 'Anthropic credentials source not configured');
+    try {
+      const labels = await source.listLabels(identity.slackUserId);
+      return c.json(labels);
+    } catch (err) {
+      getLog().warn(
+        { err, slackUserId: identity.slackUserId },
+        'connections.anthropic.list_failed'
+      );
+      return apiError(c, 502, 'Could not list credentials from cloud-edge');
+    }
+  });
+
+  app.post('/api/connections/anthropic', async c => {
+    const identity = getIdentity(c);
+    if (!identity) return apiError(c, 401, 'No OIDC identity on this request');
+    const userCreds = getUserCredsService();
+    if (!userCreds) return apiError(c, 503, 'UserCredsService not configured');
+    const source = userCreds.getAnthropicSource();
+    if (!source) return apiError(c, 503, 'Anthropic credentials source not configured');
+    let body: { credentials_json?: unknown; label?: unknown };
+    try {
+      body = await c.req.json();
+    } catch {
+      return apiError(c, 400, 'Body must be JSON');
+    }
+    const rawJson = typeof body.credentials_json === 'string' ? body.credentials_json.trim() : '';
+    if (!rawJson) return apiError(c, 400, 'credentials_json is required');
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(rawJson);
+    } catch (err) {
+      return apiError(c, 400, `credentials_json is not valid JSON: ${(err as Error).message}`);
+    }
+    const oauth =
+      parsed && typeof parsed === 'object'
+        ? ((parsed as Record<string, unknown>).claudeAiOauth as Record<string, unknown> | undefined)
+        : undefined;
+    if (!oauth || typeof oauth.accessToken !== 'string' || oauth.accessToken.length === 0) {
+      return apiError(
+        c,
+        400,
+        "credentials_json doesn't look like a credentials.json — expected `claudeAiOauth.accessToken`"
+      );
+    }
+    const label =
+      typeof body.label === 'string' && body.label.trim().length > 0
+        ? body.label.trim()
+        : undefined;
+    try {
+      const result = await userCreds.upsertAnthropic(identity.slackUserId, rawJson, label);
+      if (!result.persisted) return apiError(c, 400, result.replyText);
+      return c.json({ ok: true, message: result.replyText });
+    } catch (err) {
+      getLog().warn(
+        { err, slackUserId: identity.slackUserId },
+        'connections.anthropic.upsert_failed'
+      );
+      return apiError(c, 502, 'Could not save credentials via cloud-edge');
+    }
+  });
+
+  app.post('/api/connections/anthropic/select', async c => {
+    const identity = getIdentity(c);
+    if (!identity) return apiError(c, 401, 'No OIDC identity on this request');
+    const userCreds = getUserCredsService();
+    if (!userCreds) return apiError(c, 503, 'UserCredsService not configured');
+    const source = userCreds.getAnthropicSource();
+    if (!source) return apiError(c, 503, 'Anthropic credentials source not configured');
+    let body: { label?: unknown };
+    try {
+      body = await c.req.json();
+    } catch {
+      return apiError(c, 400, 'Body must be JSON');
+    }
+    let label: string | null;
+    if (body.label === null) {
+      label = null;
+    } else if (typeof body.label === 'string') {
+      const trimmed = body.label.trim();
+      label = trimmed.length > 0 ? trimmed : null;
+    } else {
+      return apiError(c, 400, 'label must be a string or null');
+    }
+    try {
+      await source.setArchonCredLabel(identity.slackUserId, label);
+      return c.json({ ok: true, archon_cred_label: label });
+    } catch (err) {
+      getLog().warn(
+        { err, slackUserId: identity.slackUserId },
+        'connections.anthropic.set_pref_failed'
+      );
+      return apiError(c, 502, 'Could not update preference via cloud-edge');
+    }
   });
 
   /**

@@ -681,6 +681,146 @@ describe('UserCredsService', () => {
       expect(await svc.selfFallbackToken('U1', 'U1')).toBe('gh-self');
     });
   });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // Cloud-edge anthropic source (Phase 5 unification).
+  // ──────────────────────────────────────────────────────────────────────
+  describe('anthropic source mode', () => {
+    interface FakeSource {
+      fetchCalls: string[];
+      upsertCalls: { uid: string; rawJson: string; label?: string }[];
+      labelCalls: string[];
+      prefCalls: { uid: string; label: string | null }[];
+      nextFetch: { credsJson: string; label: string; accountEmail?: string } | null;
+    }
+
+    function makeFakeSource(): { source: import('./user-creds').IAnthropicCredsSource; state: FakeSource } {
+      const state: FakeSource = {
+        fetchCalls: [],
+        upsertCalls: [],
+        labelCalls: [],
+        prefCalls: [],
+        nextFetch: null,
+      };
+      const source: import('./user-creds').IAnthropicCredsSource = {
+        async fetch(uid) {
+          state.fetchCalls.push(uid);
+          return state.nextFetch;
+        },
+        async upsert(uid, rawJson, label) {
+          state.upsertCalls.push({ uid, rawJson, label });
+          return { created: true, label: label ?? uid };
+        },
+        async listLabels(uid) {
+          state.labelCalls.push(uid);
+          return { archonCredLabel: null, labels: [] };
+        },
+        async setArchonCredLabel(uid, label) {
+          state.prefCalls.push({ uid, label });
+        },
+      };
+      return { source, state };
+    }
+
+    function newServiceWithSource(state: ReturnType<typeof makeFakeSource>): UserCredsService {
+      return new UserCredsService({
+        store,
+        usersDir,
+        anthropicProbe: probes.anthropic,
+        githubProbe: probes.github,
+        jiraProbe: probes.jira,
+        anthropicSource: state.source,
+      });
+    }
+
+    test('bootstrap strips anthropic from store entries when source set', async () => {
+      store.seed(
+        'U1',
+        JSON.stringify({
+          anthropic: { claudeAiOauth: { accessToken: 'stale-sk' } },
+          github: { type: 'oauth', accessToken: 'gh', login: 'l' },
+        })
+      );
+      const fake = makeFakeSource();
+      const svc = newServiceWithSource(fake);
+      await svc.bootstrap();
+      const overlay = svc.getEnvOverlay('U1');
+      expect(overlay?.GH_TOKEN).toBe('gh');
+      expect(overlay?.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+    });
+
+    test('ensureFreshAnthropic pulls from source, writes file, updates cache without touching store', async () => {
+      const fake = makeFakeSource();
+      fake.state.nextFetch = {
+        credsJson: JSON.stringify({ claudeAiOauth: { accessToken: 'fresh-sk', refreshToken: 'r', expiresAt: Date.now() + 60000 } }),
+        label: 'work',
+        accountEmail: 'bob@example.com',
+      };
+      const svc = newServiceWithSource(fake);
+      const ok = await svc.ensureFreshAnthropic('U1');
+      expect(ok).toBe(true);
+      expect(fake.state.fetchCalls).toEqual(['U1']);
+      const overlay = svc.getEnvOverlay('U1');
+      expect(overlay?.CLAUDE_CODE_OAUTH_TOKEN).toBe('fresh-sk');
+      const stored = await store.getSecret('U1');
+      expect(stored).toBeNull();
+      const onDisk = await readFile(join(usersDir, 'U1', '.claude', '.credentials.json'), 'utf8');
+      expect(onDisk).toContain('fresh-sk');
+    });
+
+    test('ensureFreshAnthropic returns false when source returns null (no creds)', async () => {
+      const fake = makeFakeSource();
+      fake.state.nextFetch = null;
+      const svc = newServiceWithSource(fake);
+      expect(await svc.ensureFreshAnthropic('U1')).toBe(false);
+      expect(svc.getEnvOverlay('U1')).toBeNull();
+    });
+
+    test('upsertAnthropic delegates to source and triggers ensureFreshAnthropic', async () => {
+      const fake = makeFakeSource();
+      fake.state.nextFetch = {
+        credsJson: JSON.stringify({ claudeAiOauth: { accessToken: 'sk-uploaded' } }),
+        label: 'work',
+      };
+      const svc = newServiceWithSource(fake);
+      const result = await svc.upsertAnthropic('U1', '{"claudeAiOauth":{"accessToken":"sk-uploaded"}}', 'work');
+      expect(result.persisted).toBe(true);
+      expect(fake.state.upsertCalls).toEqual([
+        { uid: 'U1', rawJson: '{"claudeAiOauth":{"accessToken":"sk-uploaded"}}', label: 'work' },
+      ]);
+      expect(fake.state.fetchCalls).toEqual(['U1']);
+    });
+
+    test('syncFromDisk does NOT propagate anthropic changes back when source set', async () => {
+      const fake = makeFakeSource();
+      fake.state.nextFetch = {
+        credsJson: JSON.stringify({ claudeAiOauth: { accessToken: 'sk-from-cloud-edge' } }),
+        label: 'work',
+      };
+      const svc = newServiceWithSource(fake);
+      await svc.ensureFreshAnthropic('U1');
+      const credsPath = join(usersDir, 'U1', '.claude', '.credentials.json');
+      await writeFile(
+        credsPath,
+        JSON.stringify({ claudeAiOauth: { accessToken: 'sk-rotated-by-sdk' } }),
+        'utf8'
+      );
+      const r = await svc.syncFromDisk('U1');
+      expect(r.rotated).toBe(false);
+      const stored = await store.getSecret('U1');
+      expect(stored).toBeNull();
+    });
+
+    test('hasAnthropicSource + getAnthropicSource reflect configuration', () => {
+      const fake = makeFakeSource();
+      const withSource = newServiceWithSource(fake);
+      expect(withSource.hasAnthropicSource()).toBe(true);
+      expect(withSource.getAnthropicSource()).toBe(fake.source);
+      const withoutSource = newService();
+      expect(withoutSource.hasAnthropicSource()).toBe(false);
+      expect(withoutSource.getAnthropicSource()).toBeNull();
+    });
+  });
 });
 
 describe('InMemorySecretStore', () => {
