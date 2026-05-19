@@ -2037,6 +2037,49 @@ export function registerApiRoutes(
     }
   });
 
+  // POST /api/connections/jira — link a Jira Cloud API token from the
+  // Settings page. Mirrors the Anthropic upsert; the Slack-side
+  // `/archon-creds jira` modal stays as an alternate entry point.
+  // Validation + Atlassian probe live in `userCreds.upsertJira`.
+  app.post('/api/connections/jira', async c => {
+    const identity = getIdentity(c);
+    if (!identity) return apiError(c, 401, 'No OIDC identity on this request');
+    const userCreds = getUserCredsService();
+    if (!userCreds) return apiError(c, 503, 'UserCredsService not configured');
+    let body: { base_url?: unknown; email?: unknown; api_token?: unknown };
+    try {
+      body = await c.req.json();
+    } catch {
+      return apiError(c, 400, 'Body must be JSON');
+    }
+    const baseUrl = typeof body.base_url === 'string' ? body.base_url.trim() : '';
+    const email = typeof body.email === 'string' ? body.email.trim() : '';
+    const apiToken = typeof body.api_token === 'string' ? body.api_token.trim() : '';
+    if (!baseUrl) return apiError(c, 400, 'base_url is required');
+    if (!email) return apiError(c, 400, 'email is required');
+    if (!apiToken) return apiError(c, 400, 'api_token is required');
+
+    try {
+      const result = await userCreds.upsertJira(identity.slackUserId, {
+        baseUrl,
+        email,
+        apiToken,
+      });
+      if (!result.persisted) return apiError(c, 400, result.replyText);
+      return c.json({ ok: true, message: result.replyText });
+    } catch (err) {
+      getLog().warn(
+        { err, slackUserId: identity.slackUserId },
+        'connections.jira.upsert_failed'
+      );
+      return apiError(
+        c,
+        500,
+        `Failed to save Jira credentials: ${(err as Error).message ?? 'unknown error'}`
+      );
+    }
+  });
+
   app.post('/api/connections/anthropic/select', async c => {
     const identity = getIdentity(c);
     if (!identity) return apiError(c, 401, 'No OIDC identity on this request');

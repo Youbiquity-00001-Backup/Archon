@@ -620,6 +620,18 @@ export async function selectAnthropicLabel(
   );
 }
 
+export async function linkJira(args: {
+  base_url: string;
+  email: string;
+  api_token: string;
+}): Promise<{ ok: true; message: string }> {
+  return fetchJSON<{ ok: true; message: string }>('/api/connections/jira', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(args),
+  });
+}
+
 // System
 export async function getHealth(): Promise<HealthResponse> {
   return fetchJSON<HealthResponse>('/api/health');
