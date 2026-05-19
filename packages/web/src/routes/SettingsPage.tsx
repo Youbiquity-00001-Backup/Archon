@@ -22,6 +22,7 @@ import {
   getAnthropicLabels,
   uploadAnthropicCreds,
   selectAnthropicLabel,
+  linkJira,
 } from '@/lib/api';
 import type {
   SafeConfigResponse,
@@ -32,6 +33,7 @@ import type {
   ConnectionsResponse,
   AnthropicConnection,
   AnthropicLabelsResponse,
+  JiraConnection,
 } from '@/lib/api';
 
 const selectClass =
@@ -433,9 +435,134 @@ function AnthropicConnectionPanel({
 }
 
 /**
+ * Jira credentials panel — in-page form to link an Atlassian API token.
+ * Backend validates URL shape + probes /rest/api/3/myself before
+ * persisting; the Slack-side `/archon-creds jira` modal stays as an
+ * alternate entry point. No probe is performed in the SPA — the
+ * server runs it (probes can take a couple seconds and need network
+ * egress) and reports the outcome via the response.
+ */
+function JiraConnectionPanel({
+  summary,
+}: {
+  summary: JiraConnection;
+}): React.ReactElement {
+  const queryClient = useQueryClient();
+  const [baseUrl, setBaseUrl] = useState('');
+  const [email, setEmail] = useState('');
+  const [apiToken, setApiToken] = useState('');
+  const [formError, setFormError] = useState<string | null>(null);
+  const [formSuccess, setFormSuccess] = useState<string | null>(null);
+
+  const linkMutation = useMutation({
+    mutationFn: async (args: { base_url: string; email: string; api_token: string }) =>
+      linkJira(args),
+    onSuccess: result => {
+      setBaseUrl('');
+      setEmail('');
+      setApiToken('');
+      setFormError(null);
+      setFormSuccess(result.message);
+      void queryClient.invalidateQueries({ queryKey: ['auth', 'connections'] });
+    },
+    onError: err => {
+      setFormSuccess(null);
+      setFormError(err instanceof Error ? err.message : 'Link failed');
+    },
+  });
+
+  const handleSubmit = (e: React.FormEvent): void => {
+    e.preventDefault();
+    setFormError(null);
+    setFormSuccess(null);
+    const trimmedBase = baseUrl.trim();
+    const trimmedEmail = email.trim();
+    const trimmedToken = apiToken.trim();
+    if (!trimmedBase || !trimmedEmail || !trimmedToken) {
+      setFormError('All three fields are required.');
+      return;
+    }
+    linkMutation.mutate({
+      base_url: trimmedBase,
+      email: trimmedEmail,
+      api_token: trimmedToken,
+    });
+  };
+
+  return (
+    <div className="space-y-3">
+      <div className="font-medium">Jira</div>
+
+      {summary.linked ? (
+        <div className="text-xs text-muted-foreground">
+          Linked as <span className="font-mono">{summary.email}</span> on{' '}
+          <span className="font-mono">{summary.baseUrl}</span>
+        </div>
+      ) : (
+        <div className="text-xs text-muted-foreground">
+          Not linked yet — fill in the form below. Generate an API token at{' '}
+          <a
+            href="https://id.atlassian.com/manage-profile/security/api-tokens"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="underline"
+          >
+            id.atlassian.com → Security → API tokens
+          </a>
+          .
+        </div>
+      )}
+
+      <form onSubmit={handleSubmit} className="space-y-2">
+        <div className="space-y-1">
+          <label className="text-xs text-muted-foreground">
+            Jira Cloud URL (must end with <code>.atlassian.net</code>)
+          </label>
+          <Input
+            value={baseUrl}
+            onChange={e => setBaseUrl(e.target.value)}
+            disabled={linkMutation.isPending}
+            placeholder="https://acme.atlassian.net"
+            className="text-xs"
+          />
+        </div>
+        <div className="space-y-1">
+          <label className="text-xs text-muted-foreground">Atlassian account email</label>
+          <Input
+            type="email"
+            value={email}
+            onChange={e => setEmail(e.target.value)}
+            disabled={linkMutation.isPending}
+            placeholder="you@example.com"
+            className="text-xs"
+          />
+        </div>
+        <div className="space-y-1">
+          <label className="text-xs text-muted-foreground">API token</label>
+          <Input
+            type="password"
+            value={apiToken}
+            onChange={e => setApiToken(e.target.value)}
+            disabled={linkMutation.isPending}
+            placeholder="ATATT3xFfGF0..."
+            className="text-xs"
+            autoComplete="off"
+          />
+        </div>
+        {formError && <div className="text-xs text-destructive">{formError}</div>}
+        {formSuccess && <div className="text-xs text-emerald-500">{formSuccess}</div>}
+        <Button type="submit" size="sm" disabled={linkMutation.isPending}>
+          {linkMutation.isPending ? 'Linking…' : summary.linked ? 'Replace credentials' : 'Link Jira'}
+        </Button>
+      </form>
+    </div>
+  );
+}
+
+/**
  * Per-user account connections (Phase A.1 / Phase 5). Anthropic uses an
- * in-page form (cloud-edge owns the chain); GitHub uses
- * `/auth/github/initiate`; Jira still uses `/archon-creds jira` in Slack.
+ * in-page form (cloud-edge owns the chain); Jira uses an in-page form
+ * (validated + probed server-side); GitHub uses `/auth/github/initiate`.
  */
 function AccountConnectionsSection(): React.ReactElement {
   const { data, isLoading, error } = useQuery<ConnectionsResponse | null>({
@@ -496,20 +623,7 @@ function AccountConnectionsSection(): React.ReactElement {
               )}
             </div>
 
-            <div>
-              <div className="font-medium">Jira</div>
-              {data.jira.linked ? (
-                <div className="text-xs text-muted-foreground">
-                  Linked as <span className="font-mono">{data.jira.email}</span> on{' '}
-                  <span className="font-mono">{data.jira.baseUrl}</span>
-                </div>
-              ) : (
-                <div className="text-xs text-muted-foreground">
-                  Not linked. Run <code>/archon-creds jira</code> in Slack DM and paste your tenant
-                  URL, Atlassian email, and API token into the modal that opens.
-                </div>
-              )}
-            </div>
+            <JiraConnectionPanel summary={data.jira} />
           </>
         )}
       </CardContent>
