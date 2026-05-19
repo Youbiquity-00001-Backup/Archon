@@ -61,6 +61,12 @@ export interface OidcMiddlewareConfig {
    * Slack user ids permitted to reach `/api/*`. The chat path enforces an
    * identical allowlist via `SLACK_ALLOWED_USER_IDS`; the web path is the
    * second enforcement point so the two surfaces stay in lockstep.
+   *
+   * Empty set = **open mode**: any user with a valid Slack OIDC JWT is
+   * permitted. Used by dev deployments that don't want to maintain a
+   * user list. ALB OIDC still enforces "must complete the Slack
+   * authorize round-trip" so the gate is still "any Slack-workspace
+   * member with a valid sub claim" — not the public internet.
    */
   allowedSlackUserIds: ReadonlySet<string>;
   /** Override for tests; defaults to `defaultPublicKeyFetcher`. */
@@ -145,7 +151,11 @@ export function createOidcMiddleware(config: OidcMiddlewareConfig): MiddlewareHa
     }
 
     const slackUserId = parseSlackSub(claims.sub);
-    if (!config.allowedSlackUserIds.has(slackUserId)) {
+    // Empty allowlist = open mode (see OidcMiddlewareConfig docstring).
+    // The size check has to come before the .has() lookup because a
+    // populated Set is the signal to enforce; an empty Set falls through
+    // to "permit any valid JWT."
+    if (config.allowedSlackUserIds.size > 0 && !config.allowedSlackUserIds.has(slackUserId)) {
       getLog().info(
         {
           slackUserIdMasked: maskUid(slackUserId),
