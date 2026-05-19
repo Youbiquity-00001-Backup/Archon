@@ -36,12 +36,25 @@ const mockListByCodebase = mock(async (_id: string) => [] as unknown[]);
 const mockRemoveWorktree = mock(async () => {});
 const mockUpdateStatus = mock(async (_id: string, _status: string) => {});
 
+// Stub UserCredsService used by the codebase-add per-user-creds path.
+// Default: no overlay. The "threads per-user env into clone" test
+// swaps this out per-test via `mockUserCredsServiceRef`.
+const mockEnsureFreshGithub = mock(async (_uid: string) => {});
+const mockGetEnvOverlay = mock((_uid: string): Record<string, string | undefined> | null => null);
+const mockUserCredsServiceRef = {
+  current: {
+    ensureFreshGithub: mockEnsureFreshGithub,
+    getEnvOverlay: mockGetEnvOverlay,
+  } as unknown as object | null,
+};
+
 mock.module('@archon/core', () => ({
   handleMessage: mock(async () => {}),
   getDatabaseType: () => 'sqlite',
   loadConfig: mock(async () => ({})),
   cloneRepository: mockCloneRepository,
   registerRepository: mockRegisterRepository,
+  getUserCredsService: () => mockUserCredsServiceRef.current,
   ConversationNotFoundError: class ConversationNotFoundError extends Error {
     constructor(id: string) {
       super(`Conversation not found: ${id}`);
@@ -438,6 +451,67 @@ describe('POST /api/codebases', () => {
     });
     expect(response.status).toBe(201);
     expect(mockRegisterRepository).toHaveBeenCalledWith('/home/user/my-repo');
+  });
+
+  test('threads per-user GitHub env into cloneRepository when identity is present', async () => {
+    // Stub the UserCredsService to report a per-user HOME + GH_TOKEN.
+    // The route should refresh github creds first, snapshot the overlay,
+    // and pass it via options.env so `git clone` reaches repos the
+    // deployment-wide PAT can't.
+    mockEnsureFreshGithub.mockReset();
+    mockGetEnvOverlay.mockReset();
+    mockGetEnvOverlay.mockImplementationOnce(() => ({
+      HOME: '/users/U_TEST',
+      GH_TOKEN: 'ghu_test',
+      CLAUDE_CODE_OAUTH_TOKEN: 'sk-oauth-test',
+    }));
+    mockCloneRepository.mockImplementationOnce(async () => ({
+      codebaseId: 'clone-uuid-1',
+      alreadyExisted: false,
+    }));
+    mockGetCodebase.mockImplementationOnce(async () => MOCK_CODEBASE);
+
+    const app = makeApp({ stubIdentitySlackUid: 'U_TEST' });
+    const response = await app.request('/api/codebases', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: 'https://github.com/private/repo' }),
+    });
+    expect(response.status).toBe(201);
+
+    expect(mockEnsureFreshGithub).toHaveBeenCalledWith('U_TEST');
+    expect(mockCloneRepository).toHaveBeenCalledWith('https://github.com/private/repo', {
+      registeredBy: 'U_TEST',
+      env: {
+        HOME: '/users/U_TEST',
+        GH_TOKEN: 'ghu_test',
+        CLAUDE_CODE_OAUTH_TOKEN: 'sk-oauth-test',
+      },
+    });
+  });
+
+  test('records registeredBy without env when overlay is empty', async () => {
+    // User has no per-user creds yet (e.g. hasn't linked GitHub) —
+    // route still records the registrar but omits the env arg.
+    mockEnsureFreshGithub.mockReset();
+    mockGetEnvOverlay.mockReset();
+    mockGetEnvOverlay.mockImplementationOnce(() => null);
+    mockCloneRepository.mockImplementationOnce(async () => ({
+      codebaseId: 'clone-uuid-2',
+      alreadyExisted: false,
+    }));
+    mockGetCodebase.mockImplementationOnce(async () => MOCK_CODEBASE);
+
+    const app = makeApp({ stubIdentitySlackUid: 'U_NO_CREDS' });
+    const response = await app.request('/api/codebases', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: 'https://github.com/public/repo' }),
+    });
+    expect(response.status).toBe(201);
+    expect(mockCloneRepository).toHaveBeenCalledWith('https://github.com/public/repo', {
+      registeredBy: 'U_NO_CREDS',
+    });
   });
 
   test('returns 400 when both url and path are provided', async () => {
