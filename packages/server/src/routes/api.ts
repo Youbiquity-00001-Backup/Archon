@@ -914,7 +914,7 @@ export function registerApiRoutes(
 ): void {
   function apiError(
     c: Context,
-    status: 400 | 401 | 403 | 404 | 422 | 500 | 503,
+    status: 400 | 401 | 403 | 404 | 422 | 500 | 502 | 503,
     message: string,
     detail?: string
   ): Response {
@@ -1973,7 +1973,10 @@ export function registerApiRoutes(
         "credentials_json doesn't look like a credentials.json — expected `claudeAiOauth.accessToken`"
       );
     }
-    const label = typeof body.label === 'string' && body.label.trim().length > 0 ? body.label.trim() : undefined;
+    const label =
+      typeof body.label === 'string' && body.label.trim().length > 0
+        ? body.label.trim()
+        : undefined;
     try {
       const result = await userCreds.upsertAnthropic(identity.slackUserId, rawJson, label);
       if (!result.persisted) return apiError(c, 400, result.replyText);

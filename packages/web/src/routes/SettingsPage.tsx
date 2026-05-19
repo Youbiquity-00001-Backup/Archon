@@ -389,7 +389,9 @@ function AnthropicConnectionPanel({
         </label>
         <textarea
           value={pasted}
-          onChange={e => setPasted(e.target.value)}
+          onChange={e => {
+            setPasted(e.target.value);
+          }}
           disabled={uploadMutation.isPending}
           rows={6}
           spellCheck={false}
@@ -403,7 +405,9 @@ function AnthropicConnectionPanel({
           </label>
           <Input
             value={labelInput}
-            onChange={e => setLabelInput(e.target.value)}
+            onChange={e => {
+              setLabelInput(e.target.value);
+            }}
             disabled={uploadMutation.isPending}
             placeholder="e.g. personal-max"
             className="text-xs"
