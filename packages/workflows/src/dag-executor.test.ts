@@ -24,6 +24,10 @@ mock.module('@archon/paths', () => ({
     return paths;
   },
   getDefaultCommandsPath: () => '/nonexistent/defaults',
+  getWorkflowFolderSearchPaths: () => ['.archon/workflows'],
+  getHomeWorkflowsPath: () => '/nonexistent/home-workflows',
+  getLegacyHomeWorkflowsPath: () => '/nonexistent/legacy-home-workflows',
+  getDefaultWorkflowsPath: () => '/nonexistent/app-defaults-workflows',
 }));
 
 // --- Bootstrap provider registry (after path mocks, before dag-executor import) ---
