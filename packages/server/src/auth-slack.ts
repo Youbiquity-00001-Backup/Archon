@@ -240,6 +240,17 @@ export async function handleSlackOidcCallback(
       );
       return c.json({ error: 'invalid redirect_after url' }, 400);
     }
+    // Guard against open-redirect attacks: only allow redirects to the same
+    // origin as callbackBase so a crafted redirect_after cannot exfiltrate
+    // the session JWT to an attacker-controlled domain.
+    const allowedOrigin = new URL(config.callbackBase).origin;
+    if (target.origin !== allowedOrigin) {
+      getLog().warn(
+        { redirectAfter: stateData.redirectAfter, allowedOrigin },
+        'auth.slack.callback_redirect_origin_denied'
+      );
+      return c.json({ error: 'redirect_after origin not permitted' }, 400);
+    }
     target.searchParams.set('token', sessionToken);
     return c.redirect(target.toString(), 302);
   }

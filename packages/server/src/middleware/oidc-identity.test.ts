@@ -1,11 +1,14 @@
 import { describe, test, expect } from 'bun:test';
+import { createSign, createHmac, generateKeyPairSync } from 'node:crypto';
 import { Hono } from 'hono';
 import {
   buildArchonSessionToken,
   verifyArchonSessionToken,
   createOidcMiddleware,
   getIdentity,
+  parseAllowedSlackUserIds,
   type OidcIdentity,
+  type PublicKeyFetcher,
 } from './oidc-identity';
 
 const SECRET = 'test-secret-do-not-use-in-prod-test-secret-do-not-use-in-prod';
@@ -77,7 +80,6 @@ describe('buildArchonSessionToken + verifyArchonSessionToken', () => {
         iat: past - 3600,
       })
     ).toString('base64url');
-    const { createHmac } = require('node:crypto') as typeof import('node:crypto');
     const sig = createHmac('sha256', SECRET)
       .update(`${header}.${payload}`)
       .digest()
@@ -95,7 +97,6 @@ describe('buildArchonSessionToken + verifyArchonSessionToken', () => {
       exp: Math.floor(Date.now() / 1000) + 3600,
       iat: Math.floor(Date.now() / 1000),
     };
-    const { createHmac } = require('node:crypto') as typeof import('node:crypto');
     const sign = (payload: Record<string, unknown>): string => {
       const p = Buffer.from(JSON.stringify(payload)).toString('base64url');
       const s = createHmac('sha256', SECRET)
@@ -114,7 +115,6 @@ describe('buildArchonSessionToken + verifyArchonSessionToken', () => {
 
   test('rejects tokens with missing or non-string sub', () => {
     const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
-    const { createHmac } = require('node:crypto') as typeof import('node:crypto');
     const sign = (payload: Record<string, unknown>): string => {
       const p = Buffer.from(JSON.stringify(payload)).toString('base64url');
       const s = createHmac('sha256', SECRET)
@@ -275,5 +275,139 @@ describe('createOidcMiddleware — Bearer-token path', () => {
       },
     });
     expect(res.status).toBe(401);
+  });
+
+  test('internal call with x-archon-internal-user attaches that identity', async () => {
+    const app = makeApp({ sessionSecret: SECRET });
+    // No x-forwarded-for → internal bypass path; x-archon-internal-user claims identity.
+    const res = await app.request('/api/echo', {
+      method: 'GET',
+      headers: { 'x-archon-internal-user': 'U_INTERNAL' },
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { identity: OidcIdentity | null };
+    expect(body.identity).toEqual({ slackUserId: 'U_INTERNAL' });
+  });
+});
+
+// ─── ALB JWT path ────────────────────────────────────────────────────────────
+
+const albKeyPair = generateKeyPairSync('ec', { namedCurve: 'P-256' });
+
+function mintAlbJwt(claims: Record<string, unknown>, kid = 'test-kid'): string {
+  const header = Buffer.from(JSON.stringify({ alg: 'ES256', kid, typ: 'JWT' })).toString(
+    'base64url'
+  );
+  const payload = Buffer.from(JSON.stringify(claims)).toString('base64url');
+  const signingInput = `${header}.${payload}`;
+  const signer = createSign('sha256');
+  signer.update(signingInput);
+  const sig = signer
+    .sign({ key: albKeyPair.privateKey, dsaEncoding: 'ieee-p1363' })
+    .toString('base64url');
+  return `${header}.${payload}.${sig}`;
+}
+
+function makeAlbApp(fetcher: PublicKeyFetcher): Hono {
+  const app = new Hono();
+  const mw = createOidcMiddleware({
+    region: 'us-east-1',
+    allowedSlackUserIds: new Set<string>(),
+    fetcher,
+  });
+  app.use('/api/*', mw);
+  app.get('/api/echo', c => {
+    const identity = getIdentity(c);
+    return c.json({ identity: identity ?? null });
+  });
+  return app;
+}
+
+const albFetcher: PublicKeyFetcher = async (_kid, _region) =>
+  albKeyPair.publicKey.export({ type: 'spki', format: 'pem' }) as string;
+
+describe('createOidcMiddleware — ALB JWT path', () => {
+  test('valid ES256 ALB JWT → 200 with identity attached', async () => {
+    const app = makeAlbApp(albFetcher);
+    const now = Math.floor(Date.now() / 1000);
+    const jwt = mintAlbJwt({
+      sub: 'TTEAM-UALICE',
+      exp: now + 300,
+      iat: now,
+      email: 'alice@example.com',
+    });
+    const res = await app.request('/api/echo', {
+      method: 'GET',
+      headers: { 'x-forwarded-for': '1.2.3.4', 'x-amzn-oidc-data': jwt },
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { identity: OidcIdentity | null };
+    expect(body.identity?.slackUserId).toBe('UALICE');
+    expect(body.identity?.email).toBe('alice@example.com');
+  });
+
+  test('expired ALB JWT → 401', async () => {
+    const app = makeAlbApp(albFetcher);
+    const past = Math.floor(Date.now() / 1000) - 60;
+    const jwt = mintAlbJwt({ sub: 'TTEAM-UALICE', exp: past, iat: past - 300 });
+    const res = await app.request('/api/echo', {
+      method: 'GET',
+      headers: { 'x-forwarded-for': '1.2.3.4', 'x-amzn-oidc-data': jwt },
+    });
+    expect(res.status).toBe(401);
+  });
+
+  test('valid ALB JWT but user not in allowlist → 403', async () => {
+    const app = new Hono();
+    const mw = createOidcMiddleware({
+      region: 'us-east-1',
+      allowedSlackUserIds: new Set(['UOTHER']),
+      fetcher: albFetcher,
+    });
+    app.use('/api/*', mw);
+    app.get('/api/echo', c => c.json({ ok: true }));
+    const now = Math.floor(Date.now() / 1000);
+    const jwt = mintAlbJwt({ sub: 'TTEAM-UALICE', exp: now + 300, iat: now });
+    const res = await app.request('/api/echo', {
+      method: 'GET',
+      headers: { 'x-forwarded-for': '1.2.3.4', 'x-amzn-oidc-data': jwt },
+    });
+    expect(res.status).toBe(403);
+  });
+
+  test('tampered signature → 401', async () => {
+    const app = makeAlbApp(albFetcher);
+    const now = Math.floor(Date.now() / 1000);
+    const jwt = mintAlbJwt({ sub: 'TTEAM-UALICE', exp: now + 300, iat: now });
+    // Flip a middle character of the signature (avoid the last char whose padding
+    // bits are ignored by base64url decoders).
+    const parts = jwt.split('.');
+    const mid = Math.floor(parts[2].length / 2);
+    const flipped =
+      parts[2].slice(0, mid) + (parts[2][mid] === 'A' ? 'B' : 'A') + parts[2].slice(mid + 1);
+    parts[2] = flipped;
+    const tampered = parts.join('.');
+    const res = await app.request('/api/echo', {
+      method: 'GET',
+      headers: { 'x-forwarded-for': '1.2.3.4', 'x-amzn-oidc-data': tampered },
+    });
+    expect(res.status).toBe(401);
+  });
+});
+
+// ─── parseAllowedSlackUserIds ─────────────────────────────────────────────────
+
+describe('parseAllowedSlackUserIds', () => {
+  test('undefined → empty set', () => expect(parseAllowedSlackUserIds(undefined).size).toBe(0));
+  test('empty string → empty set', () => expect(parseAllowedSlackUserIds('').size).toBe(0));
+  test('whitespace-only → empty set', () => expect(parseAllowedSlackUserIds('   ').size).toBe(0));
+  test('comma-separated with whitespace → trimmed set', () => {
+    expect(parseAllowedSlackUserIds(' U_ALICE , U_BOB , ')).toEqual(new Set(['U_ALICE', 'U_BOB']));
+  });
+  test('single id → set of one', () => {
+    expect(parseAllowedSlackUserIds('U_ALICE')).toEqual(new Set(['U_ALICE']));
+  });
+  test('empty entries from double commas are filtered', () => {
+    expect(parseAllowedSlackUserIds('U_ALICE,,U_BOB')).toEqual(new Set(['U_ALICE', 'U_BOB']));
   });
 });

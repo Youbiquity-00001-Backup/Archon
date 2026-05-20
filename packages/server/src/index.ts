@@ -512,7 +512,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   const sessionSecret = process.env.ARCHON_SESSION_SECRET;
 
   app.get('/auth/slack/initiate', async c => {
-    if (!slackOidcConfig) {
+    if (!slackOidcConfig || !sessionSecret) {
       getLog().warn('auth.slack.initiate_no_config');
       return c.json({ error: 'slack oidc not configured' }, 503);
     }

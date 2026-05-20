@@ -1,16 +1,16 @@
 /**
- * In-memory OAuth state token store with TTL.
+ * In-memory OAuth state stores with TTL eviction.
  *
- * Used by `/auth/github/initiate` to generate one-shot tokens that
- * `/auth/github/callback` consumes to recover the originating Slack user
- * id. Tokens are single-use (consumed on lookup) and expire after a short
- * window — defaults to 10 minutes per the design doc.
+ * `IOAuthStateStore` / `InMemoryOAuthStateStore` — generic single-use token
+ * store designed for a future GitHub OAuth flow. Not yet wired to a
+ * production route; the interface is shaped for a Redis/DDB-backed swap when
+ * multi-task deployments need it.
  *
- * Process-local: a multi-task ECS deployment will route the callback to a
- * different task than the one that minted the state. That is intentional
- * for Phase A.1 (single web task per environment) and called out in the
- * design as acceptable. A.2 may move state to a shared store; the
- * `IOAuthStateStore` interface is shaped to make that swap mechanical.
+ * `ISlackOidcStateStore` / `InMemorySlackOidcStateStore` — active: used by
+ * `/auth/slack/initiate` to carry PKCE verifier + redirectAfter across the
+ * Slack OpenID Connect round-trip.
+ *
+ * Process-local: acceptable for single web-task deployments.
  */
 import { randomBytes } from 'node:crypto';
 
@@ -81,7 +81,7 @@ export class InMemoryOAuthStateStore implements IOAuthStateStore {
  * server-side so the callback can submit it to Slack's token endpoint without
  * trusting the browser to round-trip it. `redirectAfter` is the URL the
  * caller wants Archon to bounce to once the session JWT is minted (e.g. a
- * ProductLens callback page).
+ * SPA callback page or CLI redirect handler).
  */
 export interface SlackOidcStateData {
   codeVerifier: string;

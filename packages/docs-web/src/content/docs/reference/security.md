@@ -89,7 +89,7 @@ Each platform adapter supports an optional user whitelist via environment variab
 - Every incoming message or webhook is checked before processing.
 - Unauthorized users are silently rejected -- no error response is sent back.
 - Unauthorized attempts are logged with masked user identifiers for auditing.
-- The Web UI has no built-in user authentication. Use `CADDY_BASIC_AUTH` or form auth when exposing it publicly (see [Docker / Deployment](/reference/configuration/#docker--deployment) variables).
+- The Web UI client has no built-in user authentication session. The REST API it communicates with can optionally require Bearer tokens when `ARCHON_SESSION_SECRET` is set (see [Auth env vars](/reference/configuration/#auth-web-api)). Use `CADDY_BASIC_AUTH` or form auth when exposing the Web UI publicly (see [Docker / Deployment](/reference/configuration/#docker--deployment) variables).
 
 ## Webhook Security
 

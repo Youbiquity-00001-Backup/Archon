@@ -1,5 +1,5 @@
 /**
- * ALB OIDC identity middleware (Patch 4 / Phase A.1).
+ * ALB OIDC + Bearer-token identity middleware.
  *
  * AWS Application Load Balancer with `authenticate-oidc` action injects a
  * signed JWT in `x-amzn-oidc-data` on every forwarded request. The JWT is
@@ -40,7 +40,10 @@ function getLog(): ReturnType<typeof createLogger> {
   return cachedLog;
 }
 
-/** Identity extracted from a verified ALB OIDC JWT. */
+/**
+ * Authenticated request identity, extracted from an ALB OIDC JWT,
+ * Archon session JWT (Bearer token), or `x-archon-internal-user` header.
+ */
 export interface OidcIdentity {
   /** Slack user id (the `U…` half of the `T<team>-U<user>` sub claim). */
   slackUserId: string;
@@ -250,11 +253,11 @@ export function getIdentity(c: Context): OidcIdentity | undefined {
 
 /**
  * Parse `SLACK_ALLOWED_USER_IDS` into a Set. Comma-separated, whitespace-
- * tolerant. Returns an empty Set if the env var is unset; callers decide
- * whether that means "allow all" (open dev) or "deny all" (locked-down
- * prod). The middleware factory always treats empty-allowlist as
- * deny-all — there is no scenario where Phase A.1 wants the web tier to
- * be open to every Slack workspace member.
+ * tolerant. Returns an empty Set if the env var is unset.
+ *
+ * The middleware treats an empty set as **open mode** (any valid JWT holder
+ * is permitted). Operators who want to restrict access must supply at least
+ * one user id.
  */
 export function parseAllowedSlackUserIds(envValue: string | undefined): Set<string> {
   if (!envValue || envValue.trim() === '') return new Set();

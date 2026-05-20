@@ -156,9 +156,10 @@ describe('handleSlackOidcCallback', () => {
 
   test('happy path (with redirectAfter): 302 to redirectAfter?token=...', async () => {
     const store = makeStore();
+    // redirectAfter must share the same origin as callbackBase (https://archon.example.com).
     const state = store.create({
       codeVerifier: 'verifier-r',
-      redirectAfter: 'https://app.example.com/done?other=1',
+      redirectAfter: 'https://archon.example.com/done?other=1',
     });
     const app = buildCallbackApp(store, {
       tokenExchange: async () => ({ ok: true, access_token: 'AT' }),
@@ -167,7 +168,7 @@ describe('handleSlackOidcCallback', () => {
     const res = await app.request(`/auth/slack/callback?code=C&state=${encodeURIComponent(state)}`);
     expect(res.status).toBe(302);
     const loc = new URL(res.headers.get('location')!);
-    expect(loc.origin + loc.pathname).toBe('https://app.example.com/done');
+    expect(loc.origin + loc.pathname).toBe('https://archon.example.com/done');
     expect(loc.searchParams.get('other')).toBe('1');
     const token = loc.searchParams.get('token')!;
     expect(verifyArchonSessionToken(token, SECRET)?.slackUserId).toBe('UBOB');
@@ -265,5 +266,21 @@ describe('handleSlackOidcCallback', () => {
     });
     const res = await app.request(`/auth/slack/callback?code=C&state=${encodeURIComponent(state)}`);
     expect(res.status).toBe(400);
+  });
+
+  test('cross-origin redirectAfter → 400 (open-redirect guard)', async () => {
+    const store = makeStore();
+    const state = store.create({
+      codeVerifier: 'v',
+      redirectAfter: 'https://attacker.example.com/steal',
+    });
+    const app = buildCallbackApp(store, {
+      tokenExchange: async () => ({ ok: true, access_token: 'AT' }),
+      userInfoFetcher: async () => ({ ok: true, sub: 'TT-UDAVE' }),
+    });
+    const res = await app.request(`/auth/slack/callback?code=C&state=${encodeURIComponent(state)}`);
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe('redirect_after origin not permitted');
   });
 });

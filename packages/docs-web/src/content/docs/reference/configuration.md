@@ -261,6 +261,15 @@ When `CLAUDE_USE_GLOBAL_AUTH` is unset, Archon auto-detects: it uses explicit to
 | `SLACK_APP_TOKEN` | Slack app-level token for Socket Mode (`xapp-...`) | -- |
 | `SLACK_ALLOWED_USER_IDS` | Comma-separated Slack user IDs for whitelist | Open access |
 | `SLACK_STREAMING_MODE` | Streaming mode (`stream` or `batch`) | `batch` |
+| `SLACK_CLIENT_ID` | Slack OAuth app client ID (required for OIDC direct login) | -- |
+| `SLACK_CLIENT_SECRET` | Slack OAuth app client secret (required for OIDC direct login) | -- |
+
+### Auth (Web API)
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `OAUTH_CALLBACK_BASE` | Public-facing base URL for OAuth callbacks (e.g. `https://archon.example.com`) | -- |
+| `ARCHON_SESSION_SECRET` | Secret for signing Archon session JWTs; enables `Authorization: Bearer <jwt>` on `/api/*`. Generate with: `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`. Minimum 32 random bytes. | Disabled |
 
 ### Platform Adapters -- Telegram
 
