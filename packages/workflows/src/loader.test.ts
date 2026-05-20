@@ -28,6 +28,21 @@ mock.module('@archon/paths', () => ({
   createLogger: mock(() => mockLogger),
 }));
 
+// Redirect ARCHON_HOME to a nonexistent path so workflows in a real
+// ~/.archon/workflows/ don't pollute tests. The home-scope describe block
+// overrides this per-test with its own temp directory.
+const _topLevelArchonHome = process.env.ARCHON_HOME;
+beforeEach(() => {
+  process.env.ARCHON_HOME = '/nonexistent';
+});
+afterEach(() => {
+  if (_topLevelArchonHome === undefined) {
+    delete process.env.ARCHON_HOME;
+  } else {
+    process.env.ARCHON_HOME = _topLevelArchonHome;
+  }
+});
+
 // Bootstrap provider registry (needed by isRegisteredProvider checks at load time)
 import { registerBuiltinProviders, clearRegistry } from '@archon/providers';
 clearRegistry();

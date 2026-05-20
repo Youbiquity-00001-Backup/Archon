@@ -23,12 +23,21 @@ import type { WorkflowDefinition, DagNode } from './schemas';
 
 let tmpDir: string;
 
+// Redirect ARCHON_HOME to nonexistent path so global ~/.archon/commands/ don't
+// pollute tests. The home-scoped describe block overrides this per-test.
+const _topLevelArchonHome = process.env.ARCHON_HOME;
 beforeEach(async () => {
   tmpDir = await mkdtemp(join(tmpdir(), 'validator-test-'));
+  process.env.ARCHON_HOME = '/nonexistent';
 });
 
 afterEach(async () => {
   await rm(tmpDir, { recursive: true, force: true });
+  if (_topLevelArchonHome === undefined) {
+    delete process.env.ARCHON_HOME;
+  } else {
+    process.env.ARCHON_HOME = _topLevelArchonHome;
+  }
 });
 
 function makeWorkflow(name: string, nodes: DagNode[], provider?: string): WorkflowDefinition {

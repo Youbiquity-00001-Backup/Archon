@@ -63,6 +63,13 @@ import { MessagePersistence } from './adapters/web/persistence';
 import { SSETransport } from './adapters/web/transport';
 import { WorkflowEventBridge } from './adapters/web/workflow-bridge';
 import { registerApiRoutes } from './routes/api';
+import { createOidcMiddleware, parseAllowedSlackUserIds } from './middleware/oidc-identity';
+import {
+  handleSlackOidcInitiate,
+  handleSlackOidcCallback,
+  type SlackOidcConfig,
+} from './auth-slack';
+import { InMemorySlackOidcStateStore } from './oauth-state-store';
 import {
   handleMessage,
   pool,
@@ -475,6 +482,68 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     getLog().error({ err, path: c.req.path, method: c.req.method }, 'unhandled_request_error');
     return c.json({ error: 'Internal server error' }, 500);
   });
+
+  // ─── Slack OIDC + Bearer-token auth wiring ────────────────────────────────
+  //
+  // Two surfaces, both intentionally registered BEFORE `app.use('/api/*', ...)`
+  // so the OIDC middleware does not gate them (they ARE the auth flow):
+  //   1. `/auth/slack/initiate` + `/auth/slack/callback` — PKCE round-trip
+  //      that mints an Archon session JWT (only wired when SLACK_CLIENT_ID,
+  //      SLACK_CLIENT_SECRET, OAUTH_CALLBACK_BASE are all set; otherwise
+  //      both routes 503).
+  //   2. `oidcMw` on `/api/*` — accepts either an ALB JWT
+  //      (`x-amzn-oidc-data`, set by ALB_OIDC_REGION) or a Bearer session
+  //      JWT (set by ARCHON_SESSION_SECRET). Activated when EITHER env var
+  //      is set so dev/Caddy deployments can opt in to just one.
+  const slackOidcConfig: SlackOidcConfig | null =
+    process.env.SLACK_CLIENT_ID &&
+    process.env.SLACK_CLIENT_SECRET &&
+    process.env.OAUTH_CALLBACK_BASE
+      ? {
+          clientId: process.env.SLACK_CLIENT_ID,
+          clientSecret: process.env.SLACK_CLIENT_SECRET,
+          callbackBase: process.env.OAUTH_CALLBACK_BASE,
+        }
+      : null;
+  if (!slackOidcConfig) {
+    getLog().info('slack_oidc_disabled');
+  }
+  const slackOidcStateStore = new InMemorySlackOidcStateStore();
+  const sessionSecret = process.env.ARCHON_SESSION_SECRET;
+
+  app.get('/auth/slack/initiate', async c => {
+    if (!slackOidcConfig || !sessionSecret) {
+      getLog().warn('auth.slack.initiate_no_config');
+      return c.json({ error: 'slack oidc not configured' }, 503);
+    }
+    return handleSlackOidcInitiate(c, slackOidcConfig, slackOidcStateStore);
+  });
+
+  app.get('/auth/slack/callback', async c => {
+    if (!slackOidcConfig || !sessionSecret) {
+      getLog().warn('auth.slack.callback_no_config');
+      return c.json({ error: 'slack oidc not configured' }, 503);
+    }
+    return handleSlackOidcCallback(c, slackOidcConfig, slackOidcStateStore, sessionSecret);
+  });
+
+  if (process.env.ALB_OIDC_REGION || process.env.ARCHON_SESSION_SECRET) {
+    const oidcMw = createOidcMiddleware({
+      region: process.env.ALB_OIDC_REGION,
+      allowedSlackUserIds: parseAllowedSlackUserIds(process.env.SLACK_ALLOWED_USER_IDS),
+      sessionSecret: process.env.ARCHON_SESSION_SECRET,
+    });
+    app.use('/api/*', oidcMw);
+    getLog().info(
+      {
+        albEnabled: Boolean(process.env.ALB_OIDC_REGION),
+        bearerEnabled: Boolean(process.env.ARCHON_SESSION_SECRET),
+      },
+      'auth.oidc.middleware_enabled'
+    );
+  } else {
+    getLog().info('auth.oidc.middleware_disabled');
+  }
 
   // Register Web UI API routes
   registerApiRoutes(app, webAdapter, lockManager, activePlatforms);

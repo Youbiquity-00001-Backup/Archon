@@ -32,7 +32,9 @@ You can feed this into tools like Swagger UI or use it to generate typed API cli
 
 ## Authentication
 
-None. Archon is a single-developer tool -- there is no authentication on the API by default. If you expose Archon on a network, use a reverse proxy or firewall to restrict access.
+By default, Archon has no API authentication — it is a single-developer tool. If you expose Archon on a network, use a reverse proxy or firewall to restrict access.
+
+**Optional: Bearer token authentication** — When `ARCHON_SESSION_SECRET` is set, OIDC middleware activates on all `/api/*` routes. Requests must include `Authorization: Bearer <jwt>` where the JWT was obtained from `GET /auth/slack/callback` after completing the Slack OIDC flow. Without a valid token, requests return `401 Unauthorized`. The middleware also accepts AWS ALB-issued OIDC tokens (`x-amzn-oidc-data`) when `ALB_OIDC_REGION` is set.
 
 ---
 
